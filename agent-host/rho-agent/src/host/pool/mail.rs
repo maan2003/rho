@@ -548,7 +548,11 @@ impl StopTail {
             }
         }
         let reason = stop_line(&reason, occurrences);
-        let mut body = format!("{} · {reason}", stop.word());
+        let word = match crate::worker::claude::allowance_empty(&reason) {
+            true => "stopped",
+            false => stop.word(),
+        };
+        let mut body = format!("{word} · {reason}");
         if failed_to_start {
             body.push_str("\n\nThis agent cannot start. Reply to retry, change its runtime, or start another agent.");
         }
@@ -614,6 +618,19 @@ mod tests {
         assert_eq!(
             tail.body(Stop::Failed, "cargo exited 101", false),
             "failed · cargo exited 101 ×2\n\nLast transcript lines:\n    test started ×2\n    see https://example.invalid/log\n    read ‹host path›: denied ×3\n    compiling src/clock.rs"
+        );
+    }
+
+    /// An account's empty allowance is a stop, not a failure: the agent
+    /// goes on once the account resets or the user switches it.
+    #[test]
+    fn an_empty_allowance_stops_rather_than_fails() {
+        let reason = "claude/work allowance empty · resets 5:30pm (UTC)";
+        let mut tail = StopTail::default();
+        tail.push(reason);
+        assert_eq!(
+            tail.body(Stop::Failed, reason, false),
+            "stopped · claude/work allowance empty · resets 5:30pm (UTC)"
         );
     }
 

@@ -164,20 +164,40 @@ impl Quotas {
         merged
     }
 
-    pub fn active_namespaces(&self, hosts: &impl HostNames) -> Vec<String> {
+    /// The account each host's agents run on, with the host named when the
+    /// lines carry host names.
+    pub fn active_accounts(&self, hosts: &impl HostNames) -> Vec<ActiveAccount> {
         let names = hosts.names();
         let qualify = names.len() > 1;
         names
             .iter()
             .filter_map(|(host, name)| {
                 let namespace = self.auth.get(host)?.active_namespace.as_ref()?;
-                Some(if qualify {
-                    format!("{name}/{namespace}")
-                } else {
-                    namespace.clone()
+                Some(ActiveAccount {
+                    host: qualify.then(|| name.clone()),
+                    namespace: namespace.clone(),
                 })
             })
             .collect()
+    }
+}
+
+/// The GPT account a host's agents run on. `host` is named only when more
+/// than one host is attached, and then the account's line is named
+/// `host/namespace`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveAccount {
+    pub host: Option<String>,
+    pub namespace: String,
+}
+
+impl ActiveAccount {
+    /// The name `merged_history` gives this account's line.
+    pub fn line_name(&self) -> String {
+        match &self.host {
+            Some(host) => format!("{host}/{}", self.namespace),
+            None => self.namespace.clone(),
+        }
     }
 }
 
@@ -253,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn the_active_account_is_named_the_way_its_line_is() {
+    fn each_hosts_active_account_is_starred_with_its_host() {
         let hosts = Named(vec![(LAB, "lab".to_owned()), (DESK, "desk".to_owned())]);
         let mut quotas = Quotas::default();
         quotas.set_auth(LAB, auth(&["work", "home", "fresh"], Some("work")));
@@ -262,7 +282,7 @@ mod tests {
         quotas.set_history(DESK, vec![gpt("work")]);
 
         let series = quotas.merged_history(&hosts);
-        let active = quotas.active_namespaces(&hosts);
+        let active = quotas.active_accounts(&hosts);
         let summary = crate::usage::quota_summary(&series, &active, 7, 2, 100);
         let labels = summary
             .legend
@@ -275,7 +295,7 @@ mod tests {
                 "gpt/desk/work  50% left · reset time not reported",
                 "gpt/lab/fresh  allowance not reported",
                 "gpt/lab/home  50% left · reset time not reported",
-                "★ gpt/lab/work  50% left · reset time not reported",
+                "★ lab · gpt/work  50% left · reset time not reported",
             ]
         );
     }

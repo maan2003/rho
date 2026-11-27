@@ -1,6 +1,6 @@
 //! Worker-owned runtimes, host-service client, and workset execution.
 
-mod claude;
+pub(crate) mod claude;
 pub(crate) mod host_client;
 mod image_tool;
 pub mod native;

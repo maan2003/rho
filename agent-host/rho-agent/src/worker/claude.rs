@@ -206,6 +206,10 @@ pub(crate) struct ClaudeLoop {
     /// The CLI said this turn that its account cannot reach the model; the
     /// turn's failure then says what to do about it on the host.
     authentication_failed: bool,
+    /// The CLI said this turn that its account's allowance is used up, and
+    /// when it resets if it said; the turn's failure is then a stop that
+    /// names the account (`usage.md`).
+    allowance_empty: Option<EmptyAllowance>,
     /// The notebook, once the first spawn has built it. Outlives the
     /// process: cells keep running across a respawn.
     python: Option<python_host::PythonHost>,
@@ -433,6 +437,7 @@ impl ClaudeLoop {
             claude_plugin_dir: None,
             launched: None,
             authentication_failed: false,
+            allowance_empty: None,
             python: None,
             outbox,
             outbound,
@@ -1579,6 +1584,9 @@ impl ClaudeLoop {
                     return Ok(());
                 }
                 self.authentication_failed |= message.authentication_failed();
+                if message.allowance_empty() {
+                    self.allowance_empty.get_or_insert_default();
+                }
                 match reply_row(
                     &message,
                     usage_model(self.running_model()),
@@ -1615,6 +1623,7 @@ impl ClaudeLoop {
             rho_claude::ClaudeEvent::Result(message) => {
                 let successful = !message.is_error;
                 let authentication_failed = std::mem::take(&mut self.authentication_failed);
+                let allowance_empty = self.allowance_empty.take();
                 if let Some(host) = &mut self.python {
                     host.turn_ended(
                         rho_agent_types::UnixMs::now(),
@@ -1647,6 +1656,16 @@ impl ClaudeLoop {
                         None => self.host.claude_account().await?,
                     };
                     self.fail(anyhow::anyhow!("{}", not_logged_in(&account)))
+                        .await?;
+                } else if message.is_error
+                    && let Some(allowance) = allowance_empty
+                {
+                    let account = match &self.launched {
+                        Some(launched) => launched.account.clone(),
+                        None => self.host.claude_account().await?,
+                    };
+                    let said = message.failure_message();
+                    self.fail(anyhow::anyhow!("{}", allowance.stop(&account, &said)))
                         .await?;
                 } else if message.is_error {
                     self.fail(anyhow::anyhow!("{}", message.failure_message()))
@@ -1712,7 +1731,13 @@ impl ClaudeLoop {
                     self.published();
                 }
             }
-            rho_claude::ClaudeEvent::RateLimitEvent(_) => {}
+            rho_claude::ClaudeEvent::RateLimitEvent(event) => {
+                if event.rate_limit_info.rejected() {
+                    self.allowance_empty = Some(EmptyAllowance {
+                        resets_at: event.rate_limit_info.resets_at,
+                    });
+                }
+            }
             rho_claude::ClaudeEvent::Other => {}
         }
         Ok(())
@@ -2331,6 +2356,47 @@ async fn finish_rewind(
     Ok(())
 }
 
+/// What Claude Code said of an account whose allowance is used up: when
+/// it resets, as a Unix time, if it said.
+#[derive(Debug, Default)]
+struct EmptyAllowance {
+    resets_at: Option<i64>,
+}
+
+/// What the stop of a turn that failed for want of allowance says after
+/// `stopped`: which account, and when it resets when known, from the rate
+/// limit's time or else the CLI's own words (`resets 5:30pm (UTC)`).
+const ALLOWANCE_EMPTY: &str = "allowance empty";
+
+impl EmptyAllowance {
+    fn stop(&self, account: &str, said: &str) -> String {
+        let resets = self
+            .resets_at
+            .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
+            .map(|at| at.format("%b %-d %H:%M UTC").to_string())
+            .or_else(|| {
+                said.split_once("resets ")
+                    .map(|(_, when)| rho_agent_types::one_line(when))
+                    .filter(|when| !when.is_empty())
+            });
+        match resets {
+            Some(resets) => format!("claude/{account} {ALLOWANCE_EMPTY} · resets {resets}"),
+            None => format!("claude/{account} {ALLOWANCE_EMPTY}"),
+        }
+    }
+}
+
+/// Whether a failure is a Claude account's allowance running out, which
+/// its stop calls `stopped` rather than `failed`: the agent is fine and
+/// goes on once the account resets or the user switches it.
+pub(crate) fn allowance_empty(reason: &str) -> bool {
+    reason.starts_with("claude/")
+        && reason
+            .split(" · ")
+            .next()
+            .is_some_and(|head| head.ends_with(ALLOWANCE_EMPTY))
+}
+
 /// What a turn that failed for want of a login says, in the host's words:
 /// which account it is and what to run on the host about it.
 fn not_logged_in(account: &str) -> String {
@@ -2554,6 +2620,159 @@ mod tests {
                     Event::Failed { error, .. } if error == explanation
                 ))
         );
+    }
+
+    /// An account whose allowance runs out stops its agent with a stop
+    /// that names the account and when it resets, from the rate limit's
+    /// time, or else the CLI's own words; with neither, it says no time.
+    #[test]
+    fn an_empty_allowance_names_the_account_and_when_it_resets() {
+        let said = "You've hit your session limit · resets 5:30pm (UTC)";
+        let timed = EmptyAllowance {
+            resets_at: Some(1_783_173_000),
+        };
+        assert_eq!(
+            timed.stop("work", said),
+            "claude/work allowance empty · resets Jul 4 13:50 UTC"
+        );
+        let untimed = EmptyAllowance::default();
+        assert_eq!(
+            untimed.stop("work", said),
+            "claude/work allowance empty · resets 5:30pm (UTC)"
+        );
+        assert_eq!(
+            untimed.stop("main", "Rate limited"),
+            "claude/main allowance empty"
+        );
+        assert!(allowance_empty(
+            "claude/work allowance empty · resets 5:30pm (UTC)"
+        ));
+        assert!(allowance_empty("claude/main allowance empty"));
+        assert!(!allowance_empty(
+            "You've hit your session limit · resets 5:30pm (UTC)"
+        ));
+        assert!(!allowance_empty("cargo test: claude/work allowance empty"));
+    }
+
+    /// The CLI's rate limit, rejected, and its failed turn come together:
+    /// the agent fails with the account's empty allowance, not the CLI's
+    /// words, and a later failure for another reason says its own.
+    #[tokio::test]
+    async fn a_rejected_rate_limit_fails_the_turn_on_the_accounts_allowance() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
+        let agent_id = agent(1);
+        let workset = WorksetId([1; 6]);
+        let mut write = db.write().await;
+        write.init_store_tables();
+        write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+        write
+            .append(
+                workset,
+                &Record {
+                    at: UnixMs(2),
+                    event: Event::AgentCreated {
+                        agent: agent_id,
+                        spec: AgentSpec {
+                            runtime: Runtime::Claude {
+                                model: Model::Opus,
+                                effort: Effort::High,
+                                session_id: Uuid::new_v4(),
+                            },
+                            props: Default::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        write.commit();
+        crate::testing::python(agent_id, &db);
+        let host = crate::testing::services_pair(db.clone(), agent_id, std::sync::Weak::new());
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap();
+        let (agent, mut runtime) = ClaudeLoop::load(
+            agent_id,
+            host.clone(),
+            crate::inference::testing::backend(),
+            rho_claude::accounts::ClaudePaths::at(root.join("claude")),
+            Arc::new(Permissions::Bypass),
+            root,
+        )
+        .await
+        .unwrap();
+        runtime.launched = Some(Launch {
+            account: "work".to_owned(),
+            model: Model::Opus,
+            effort: Effort::High,
+        });
+        let said = "You've hit your session limit · resets 5:30pm (UTC)";
+        let failed_with = |result: &str| {
+            rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": result,
+                }))
+                .unwrap(),
+            )
+        };
+        runtime
+            .handle_event(
+                serde_json::from_value(serde_json::json!({
+                    "type": "rate_limit_event",
+                    "rate_limit_info": {
+                        "status": "rejected",
+                        "resetsAt": 1_783_173_000,
+                        "rateLimitType": "five_hour"
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        runtime.handle_event(failed_with(said)).await.unwrap();
+        let InferenceState::Failed { error, .. } = agent.status().runtime.inference else {
+            panic!("the agent failed");
+        };
+        assert_eq!(
+            error,
+            "claude/work allowance empty · resets Jul 4 13:50 UTC"
+        );
+
+        // The CLI's own message says so too, with no rate limit event.
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Assistant(
+                serde_json::from_value(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "id": "e0be9f8f-c1ab-49fa-a8f1-2b3400ade664",
+                        "model": "<synthetic>",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": said}],
+                    },
+                    "parent_tool_use_id": null,
+                    "session_id": Uuid::new_v4(),
+                    "uuid": Uuid::new_v4(),
+                    "error": "rate_limit",
+                    "is_api_error_message": true,
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        runtime.handle_event(failed_with(said)).await.unwrap();
+        let InferenceState::Failed { error, .. } = agent.status().runtime.inference else {
+            panic!("the agent failed");
+        };
+        assert_eq!(error, "claude/work allowance empty · resets 5:30pm (UTC)");
+
+        runtime
+            .handle_event(failed_with("Overloaded"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            agent.status().runtime.inference,
+            InferenceState::Failed { error, .. } if error == "Overloaded"
+        ));
     }
 
     /// Switching the Claude account moves a running agent: its next

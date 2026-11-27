@@ -163,9 +163,19 @@ pub struct RateLimitEvent {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitInfo {
+    /// `allowed`, `allowed_warning`, or `rejected` once the account's
+    /// allowance is used up until `resets_at`.
+    pub status: Option<String>,
     pub rate_limit_type: Option<String>,
     pub resets_at: Option<i64>,
     pub utilization: Option<f64>,
+}
+
+impl RateLimitInfo {
+    /// Whether the account may not ask its model again until it resets.
+    pub fn rejected(&self) -> bool {
+        self.status.as_deref() == Some("rejected")
+    }
 }
 
 /// A request the CLI makes of the process driving it. With an SDK-hosted
@@ -218,6 +228,12 @@ impl AssistantMessage {
     /// or one that expired and could not be renewed.
     pub fn authentication_failed(&self) -> bool {
         self.error.as_deref() == Some("authentication_failed")
+    }
+
+    /// Whether the CLI said its account's allowance is used up: its rate
+    /// limit hit, or its plan's usage spent.
+    pub fn allowance_empty(&self) -> bool {
+        matches!(self.error.as_deref(), Some("rate_limit" | "billing_error"))
     }
 
     pub fn text(&self) -> String {

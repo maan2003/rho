@@ -38,7 +38,7 @@ use rho_agent_types::{AgentId, EndpointId, MessageId, WorksetId};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
 use rho_agents_client::protocol::{AgentCostDistribution, GlobalUsage, QuotaHistory, QuotaSeries};
-use rho_agents_client::quota::Quotas;
+use rho_agents_client::quota::{ActiveAccount, Quotas};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, Heard, now_ms};
@@ -1234,11 +1234,11 @@ impl AgentsSystem {
 
     /// Every host's quota history merged, with the accounts agents run on;
     /// `None` until a host has answered.
-    pub(crate) fn quota_history(&self) -> Option<(Vec<QuotaSeries>, Vec<String>)> {
+    pub(crate) fn quota_history(&self) -> Option<(Vec<QuotaSeries>, Vec<ActiveAccount>)> {
         self.quotas.has_history().then(|| {
             (
                 self.quotas.merged_history(&self.registry),
-                self.quotas.active_namespaces(&self.registry),
+                self.quotas.active_accounts(&self.registry),
             )
         })
     }

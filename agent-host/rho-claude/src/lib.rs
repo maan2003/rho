@@ -825,6 +825,25 @@ mod tests {
         );
         assert_eq!(event.rate_limit_info.resets_at, Some(1_783_173_000));
         assert_eq!(event.rate_limit_info.utilization, Some(0.496));
+        assert!(!event.rate_limit_info.rejected(), "still allowed");
+    }
+
+    #[test]
+    fn a_rejected_rate_limit_says_the_allowance_is_used_up() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "rejected",
+                "resetsAt": 1783173000,
+                "rateLimitType": "five_hour"
+            }
+        }))
+        .unwrap();
+        let protocol::ClaudeEvent::RateLimitEvent(event) = event else {
+            panic!("expected rate limit event");
+        };
+        assert!(event.rate_limit_info.rejected());
+        assert_eq!(event.rate_limit_info.resets_at, Some(1_783_173_000));
     }
 
     #[test]

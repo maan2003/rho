@@ -16,6 +16,8 @@
 
 use std::collections::HashMap;
 
+use crate::quota::ActiveAccount;
+
 const HOUR_MS: u64 = 60 * 60 * 1_000;
 const DAY_MS: u64 = 24 * HOUR_MS;
 
@@ -118,7 +120,7 @@ pub struct AgentCostSummary {
 /// reduction to `columns` is what keeps that off the frame.
 pub fn quota_summary(
     series: &[crate::protocol::QuotaSeries],
-    active_auth_namespaces: &[String],
+    active_accounts: &[ActiveAccount],
     days: u64,
     now: u64,
     columns: usize,
@@ -145,25 +147,31 @@ pub fn quota_summary(
                 color
             }
         };
-        let active = account.model == "gpt"
-            && account
-                .auth_namespace
-                .as_ref()
-                .is_some_and(|name| active_auth_namespaces.contains(name));
-        let mut label = if active {
-            "★ ".to_owned()
-        } else {
-            String::new()
-        };
-        label.push_str(&account.model);
+        let active = (account.model == "gpt")
+            .then(|| {
+                active_accounts.iter().find(|active| {
+                    account.auth_namespace.as_deref() == Some(active.line_name().as_str())
+                })
+            })
+            .flatten();
         // A sole Claude allowance is recognizable by its model. Show the
         // account name when more than one account reports that allowance.
-        if let Some(name) = &account.auth_namespace
-            && (account.model == "gpt" || repeated)
-        {
-            label.push('/');
-            label.push_str(name);
-        }
+        let line = match &account.auth_namespace {
+            Some(name) if account.model == "gpt" || repeated => {
+                format!("{}/{name}", account.model)
+            }
+            _ => account.model.clone(),
+        };
+        let mut label = match active {
+            // With more than one host the star names the host, and the
+            // account reads by the name it has on that host.
+            Some(ActiveAccount {
+                host: Some(host),
+                namespace,
+            }) => format!("★ {host} · {}/{namespace}", account.model),
+            Some(_) => format!("★ {line}"),
+            None => line,
+        };
         label.push_str(&quota_latest_suffix(account.points.last(), now));
         legend.push(Legend { color, label });
 
@@ -867,7 +875,16 @@ mod tests {
             gpt("work", 66, Some(5 * 86_400)),
             gpt("other", 0, None),
         ];
-        let summary = quota_summary(&series, &["work".to_owned()], 7, now, 100);
+        let summary = quota_summary(
+            &series,
+            &[ActiveAccount {
+                host: None,
+                namespace: "work".to_owned(),
+            }],
+            7,
+            now,
+            100,
+        );
         let labels = summary
             .legend
             .iter()
