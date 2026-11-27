@@ -16,9 +16,7 @@
 //! crate (`rho-window`) owns the sheet and its tokens.
 
 use gpui::prelude::*;
-use gpui::{
-    App, Font, FontWeight, Hsla, Pixels, TextRun, TextStyle, Window, WindowTextSystem, div, px,
-};
+use gpui::{App, Font, Hsla, Pixels, TextRun, TextStyle, Window, WindowTextSystem, div, px};
 use rho_frame::Layout;
 use theme::ActiveTheme as _;
 
@@ -33,7 +31,12 @@ pub const TOP_LINE: Pixels = px(rho_window::layout::TOP_ROW_PX);
 /// The notch mask the window draws at the top centre.
 pub const NOTCH: Pixels = px(rho_window::layout::NOTCH_MASK_PX);
 /// `design.same band gap`.
-pub const BAND_GAP: Pixels = px(12.);
+pub const BAND_GAP: Pixels = px(rho_window::layout::BAND_GAP_PX);
+/// `design.draft gutter stroke`: the editor gutter on a sheet, where the
+/// user's `2 px` bar is drawn, with `10 px` of air before the first letter.
+pub const GUTTER: Pixels = px(12.);
+/// `design.top gap`: air between the top line and the sheet's first row.
+pub const TOP_GAP: Pixels = px(rho_window::layout::TOP_GAP_PX);
 
 /// The colour tokens of `product/design.md`, bundled dark appearance.
 pub mod token {
@@ -43,19 +46,14 @@ pub mod token {
         Color::oklch(l, c, h, 1.).into()
     }
 
-    /// The newest unread turn and the page title.
-    pub fn unread_text() -> Hsla {
-        oklch(0.895, 0.008, 95.)
-    }
-
-    /// Primary readable body text.
+    /// Every turn's words, the project's and the notes' alike, read or not.
     pub fn reading_text() -> Hsla {
-        oklch(0.835, 0.010, 95.)
+        oklch(0.709, 0.012, 95.)
     }
 
-    /// Body text the reader has already read.
-    pub fn read_text() -> Hsla {
-        oklch(0.735, 0.010, 95.)
+    /// A page heading's title: a step brighter than the text, at its weight.
+    pub fn title() -> Hsla {
+        oklch(0.780, 0.012, 95.)
     }
 
     /// Context that can wait: read ages, settled things, hints.
@@ -80,12 +78,12 @@ pub mod token {
 
     /// The user's own words: their draft and their messages.
     pub fn marked() -> Hsla {
-        oklch(0.810, 0.065, 185.)
+        oklch(0.720, 0.072, 185.)
     }
 
     /// The bar beside every line of the user's own words.
     pub fn marked_bar() -> Hsla {
-        oklch(0.680, 0.095, 185.)
+        oklch(0.600, 0.085, 185.)
     }
 
     /// The same bar, as a transcript's gutter colour.
@@ -157,11 +155,22 @@ pub fn column_width(text: &TextStyle, window: &Window) -> Pixels {
         .unwrap_or(size * 0.6)
 }
 
-/// The sheet's width for `text`: the measure, the editor's half-column
-/// gutter where the bars are drawn, and a column for the cursor at a line's
-/// end.
+/// The sheet's width for `text`: the measure, the gutter where the bars
+/// are drawn, and a column for the cursor at a line's end.
 pub fn sheet_width(text: &TextStyle, window: &Window) -> Pixels {
-    column_width(text, window) * (SHEET_COLUMNS as f32 + 1.5)
+    column_width(text, window) * (SHEET_COLUMNS as f32 + 1.) + GUTTER
+}
+
+/// The width of a block of `columns` on the sheet: the same gutter and
+/// cursor column as the whole sheet.
+pub fn measure_width(text: &TextStyle, window: &Window, columns: usize) -> Pixels {
+    column_width(text, window) * (columns as f32 + 1.) + GUTTER
+}
+
+/// Gives a sheet's editor the sheet's gutter: the bar at the sheet's left
+/// edge, and the words after its air.
+pub fn take_gutter(editor: &mut editor::Editor, cx: &mut gpui::Context<editor::Editor>) {
+    editor.set_compact_gutter_width(Some(GUTTER), cx);
 }
 
 /// How wide text is, in columns of the buffer font (`ch`, the advance of
@@ -190,13 +199,15 @@ impl Measure {
         Self::Font { font, size, column }
     }
 
-    /// How many columns of text a sheet `width` wide holds: the half-column
-    /// gutter, the cursor's column at a line's end and half a column of
-    /// slack taken off, so that a line padded to it never wraps.
+    /// How many columns of text a sheet `width` wide holds: the gutter,
+    /// the cursor's column at a line's end and half a column of slack
+    /// taken off, so that a line padded to it never wraps.
     pub fn columns_in(&self, width: Pixels) -> usize {
         match self {
             Self::Columns => SHEET_COLUMNS,
-            Self::Font { column, .. } => (width / *column - 2.).floor().max(1.) as usize,
+            Self::Font { column, .. } => {
+                ((width - GUTTER) / *column - 1.5).floor().max(1.) as usize
+            }
         }
     }
 
@@ -260,10 +271,10 @@ pub fn page(
     }
     let viewport = window.viewport_size().width;
     let sheet = sheet_width(text, window);
-    // The heading has all the top line left of the notch: from the reading
-    // inset to a band gap before the notch. Under the sheet's left edge it
-    // would cut a long subject to a few letters on a laptop.
-    let ear = (viewport / 2. - NOTCH / 2. - BAND_GAP - READING_INSET).max(px(0.));
+    // The heading starts where the sheet's words do, after the gutter, and
+    // is cut a band gap before the notch.
+    let left = rho_window::layout::sheet_left(viewport, sheet) + GUTTER;
+    let ear = rho_window::layout::heading_room(left, rho_window::layout::Notch::of(viewport));
     root.child(
         div()
             .h(TOP_LINE)
@@ -272,7 +283,7 @@ pub fn page(
             .flex()
             .flex_row()
             .items_center()
-            .pl(READING_INSET)
+            .pl(left)
             .child(top_line(heading).max_w(ear)),
     )
     .child(
@@ -283,13 +294,14 @@ pub fn page(
             .flex()
             .flex_row()
             .justify_center()
+            .pt(TOP_GAP)
             .px(READING_INSET)
             .child(div().h_full().w_full().max_w(sheet).child(body)),
     )
 }
 
-/// The heading's words: the title in `unread text` with emphasis, the
-/// context quiet, the marker in its colour. The title is cut first.
+/// The heading's words: the title in `title` at the text's own weight,
+/// the context quiet, the marker in its colour. The title is cut first.
 pub fn top_line(heading: &Heading) -> gpui::Div {
     let mut line = div()
         .flex()
@@ -303,8 +315,7 @@ pub fn top_line(heading: &Heading) -> gpui::Div {
             div()
                 .min_w_0()
                 .truncate()
-                .font_weight(FontWeight(680.))
-                .text_color(token::unread_text())
+                .text_color(token::title())
                 .child(heading.title.clone()),
         );
     for words in &heading.context {

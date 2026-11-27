@@ -2554,7 +2554,7 @@ fn transcript_style(class: StyleClass) -> gpui::HighlightStyle {
             (oklch(0.78, 0.012, 95.), false)
         }
         // What a call gave back, a shade under the call.
-        StyleClass::ToolDetail => (token::read_text(), false),
+        StyleClass::ToolDetail => (token::reading_text(), false),
         StyleClass::SystemInfo | StyleClass::Time | StyleClass::AgentLabel => {
             (token::quiet(), false)
         }

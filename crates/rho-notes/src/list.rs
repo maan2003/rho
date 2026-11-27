@@ -140,6 +140,7 @@ impl NotesView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
+            crate::sheet::take_gutter(&mut editor, cx);
             editor
         });
         let style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
@@ -536,7 +537,7 @@ impl Render for NotesView {
             .update(cx, |editor, cx| editor.style(cx).text.clone());
         // The find line starts on the rows' left edge, after the editor's
         // half-column gutter.
-        let gutter = sheet::column_width(&style, window) * 0.5;
+        let gutter = sheet::GUTTER;
         let this = cx.weak_entity();
         let measured = style.clone();
         let body = div()

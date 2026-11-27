@@ -69,6 +69,7 @@ impl UsageSurface {
         let editor = cx.new(|cx| {
             let mut editor = Editor::for_buffer(buffer.clone(), None, window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
+            rho_chat::ui::sheet::take_gutter(&mut editor, cx);
             editor.set_read_only(true);
             editor
         });

@@ -1141,6 +1141,9 @@ pub struct Editor {
     breadcrumbs_visibility: BreadcrumbsVisibility,
     show_gutter: bool,
     show_compact_gutter: bool,
+    /// The compact gutter's width when the host sets it, rather than half
+    /// a character: room for a gutter highlight and air before the text.
+    compact_gutter_width: Option<Pixels>,
     show_scrollbars: ScrollbarAxes,
     minimap_visibility: MinimapVisibility,
     offset_content: bool,
@@ -1443,6 +1446,7 @@ pub struct EditorSnapshot {
     centered_rows: Arc<[Anchor]>,
     show_gutter: bool,
     show_compact_gutter: bool,
+    compact_gutter_width: Option<Pixels>,
     offset_content: bool,
     sticky_line_number_digits: usize,
     show_line_numbers: Option<bool>,
@@ -2693,6 +2697,7 @@ impl Editor {
             breadcrumbs_visibility: BreadcrumbsVisibility::from_settings(cx),
             show_gutter: full_mode,
             show_compact_gutter: false,
+            compact_gutter_width: None,
             search_results_hold: None,
             show_line_numbers: (!full_mode).then_some(false),
             use_relative_line_numbers: None,
@@ -3553,6 +3558,7 @@ impl Editor {
             centered_rows: self.centered_rows.clone(),
             show_gutter: self.show_gutter,
             show_compact_gutter: self.show_compact_gutter,
+            compact_gutter_width: self.compact_gutter_width,
             offset_content: self.offset_content,
             sticky_line_number_digits: self
                 .search_results_hold
@@ -13748,6 +13754,13 @@ impl EditorSnapshot {
         if self.has_gutter_images {
             GutterDimensions {
                 width: style.text.line_height_in_pixels(window.rem_size()) * 1.25 + font_size * 0.5,
+                ..Default::default()
+            }
+        } else if self.show_compact_gutter
+            && let Some(width) = self.compact_gutter_width
+        {
+            GutterDimensions {
+                width,
                 ..Default::default()
             }
         } else if self.show_compact_gutter

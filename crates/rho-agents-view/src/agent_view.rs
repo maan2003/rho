@@ -241,6 +241,7 @@ impl AgentModel {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
+            rho_chat::ui::sheet::take_gutter(&mut editor, cx);
             editor.disable_bracket_colorization(cx);
             editor.set_read_only(true);
             editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);

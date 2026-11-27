@@ -13,10 +13,10 @@ done when: the user knows what waits and can carry on where they left off, draft
 day: Know what wants them, and where they were.
 
 ## concept Desk
-decided: 2026-11-27 · pure view-only glance (NO text cursor, NO editor buffer, NO row selection); count (`desk · 13 wait`) sits in Desk's top-left title row; row 1 is Card 1 with no subheader; clean 1-line tabular sheet inside 128ch (subject · exception tag · project · quiet right age); away hosts live in the Top-Right Global Status Bar only (never repeated inside Desk)
+decided: 2026-11-27 · pure view-only glance (NO text cursor, NO editor buffer, NO row selection); count (`desk · 13 wait`) sits in Desk's top-left title row; row 1 is Card 1 with no subheader; clean 1-line tabular sheet inside a 92ch table on the title's left edge, 14px below the top row (subject · exception tag in its colour · project · quiet right age); away hosts live in the Top-Right Global Status Bar only (never repeated inside Desk)
 purpose: show what wants the user, and where to put the next idea.
 principle: the user comes back after lunch, glances at three things waiting in a crisp view-only tabular sheet starting on row 1, and hits `space-j` to deal the first.
-sees: in Desk's own top-left title row, `desk` and `N wait` (counted from local cache while hosts connect — never flashing a false `0 wait`; `away` hosts and active dealer focus stay in the Top-Right Global Status Bar and are never repeated inside the Desk body); in the `128 ch` centered sheet starting directly at row 1 (no subheader), up to seven 1-line tabular `deal.Card` rows in deal order (including locally cached waiting cards from away hosts), each showing subject, optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project address, and right-aligned `quiet` age, then `and N more · …` quietly below for the rest. Pure view-only glance — no cursor and no row selection.
+sees: in Desk's own top-left title row, `desk` and `N wait` (counted from local cache while hosts connect — never flashing a false `0 wait`; `away` hosts and active dealer focus stay in the Top-Right Global Status Bar and are never repeated inside the Desk body); in a `92 ch` centered table whose left edge the title row shares, starting at row 1 after the `14 px` top gap (no subheader), up to seven 1-line tabular `deal.Card` rows in deal order (including locally cached waiting cards from away hosts), each showing subject, optional exception tag (`approve push` in `attention`, a stop such as `failed` or `3 stopped` in `failed`, `away` in `quiet`), right-aligned `quiet` project address, and right-aligned `quiet` age, then `and N more · …` quietly below for the rest. Pure view-only glance — no cursor and no row selection.
 does:
 - open `tab` (or `open desk` in `window.Commands`): show the desk, as `window.Screen`
 - deal `space-j` (`ctrl-j`), or click/tap a row: open the top card in active dealer focus (or the clicked/tapped card)
@@ -30,11 +30,11 @@ rejected:
 - immediate deal on bare `space` on `Desk` · 2026-11-26 · broke `space f` on `Desk`; `space-j` already deals in one gesture, keeping `space` a uniform prefix everywhere
 
 ## screen Desk
-decided: 2026-11-27 · pure view-only 128ch tabular glance starting on row 1 (no cursor, no row selection; subject · exception tag · project · quiet age), top-left title row holds `desk · N wait`, Top-Right Global Status Bar holds `away` hosts and active focus
+decided: 2026-11-27 · pure view-only 92ch tabular glance starting on row 1 (no cursor, no row selection; subject · exception tag · project · quiet age), top-left title row holds `desk · N wait`, Top-Right Global Status Bar holds `away` hosts and active focus
 answers: what needs the user now?
 shows:
 - top-left title row: `desk` and the global waiting count (`N wait`, counted from local cache while hosts connect)
-- `deal.Card` view-only tabular sheet (`128 ch`, starting on row 1): up to seven 1-line waiting rows in deal order, each with subject, optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project, and right-aligned `quiet` age. Repeated stops in one project share a row at the first stop's place. The overflow sits quietly below (`and 2 more · clock`).
+- `deal.Card` view-only tabular sheet (`92 ch`, starting on row 1 after the `14 px` top gap): up to seven 1-line waiting rows in deal order, each with subject, optional exception tag (`approve push` in `attention`, a stop in `failed`, `away` in `quiet`), right-aligned `quiet` project, and right-aligned `quiet` age. Repeated stops in one project share a row at the first stop's place. The overflow sits quietly below (`and 2 more · clock`).
 states:
 - empty: top-left title row reads `desk · 0 wait` once every attached host answers; calm empty sheet
 - loading: counts from local cache (never flashes a false `0 wait` while hosts connect) while `connecting` shows calmly in the Top-Right Global Status Bar

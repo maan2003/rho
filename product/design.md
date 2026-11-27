@@ -6,15 +6,15 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - reading surface · `oklch(23.0% 0.018 150)` · the continuous field the user reads and writes on.
 - global status surface · `oklch(20.6% 0.016 150)` · the subtle recessed field of the framed Right Ear global status bar.
 - notch mask · `#000000` · solid square black rectangle framing the physical top-center notch so it reads as crisp square geometry.
-- unread text · `oklch(89.5% 0.008 95)` · the newest unread agent turn and active page title.
-- reading text · `oklch(83.5% 0.010 95)` · primary readable body text (`oklch(73.5% 0.010 95)` for already-read history).
-- quiet · `oklch(56.0% 0.012 110)` · context that can wait: read ages, settled things, host tags, calm `away` host notes in the Top-Right Global Status Bar, `NOR` mode, and hints.
-- attention · `oklch(79.5% 0.145 78)` · something to act on: unread message age, pending push approval, or the waiting lamp.
+- reading text · `oklch(70.9% 0.012 95)` · every agent turn and body text, read or unread, in one calm OKSolar voice (no brightness split between unread and read).
+- title · `oklch(78.0% 0.012 95)` at the text's own weight · a page heading's title, one step brighter than the text.
+- quiet · `oklch(56.0% 0.012 110)` · context that can wait: every turn age, settled things, Desk's `away` tag, host tags, calm `away` host notes in the Top-Right Global Status Bar, `NOR` mode, and hints.
+- attention · `oklch(79.5% 0.145 78)` · something to act on: pending push approval (`approve push` on Desk and the thread title row) or the waiting lamp. Never a turn age.
 - lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach (`needs you`, or an `away` host required by the open screen).
 - failed · `oklch(75.0% 0.145 25)` · a step that did not finish successfully.
 - answer · `oklch(78.0% 0.105 230)` · links and short explanatory notices (`oklch(74.0% 0.130 145)` for positive echoes).
-- marked · `oklch(81.0% 0.065 185)` text with `oklch(68.0% 0.095 185)` `2 px` left gutter bar · muted teal marking the user's own Draft and messages in a thread, plus prompt query matches and choice keys.
-- search match · `oklch(35.0% 0.085 85)` background highlight with `unread text` · makes `/` and `?` matches stand out clearly inside both agent prose and muted-teal user messages.
+- marked · `oklch(72.0% 0.072 185)` text with `oklch(60.0% 0.085 185)` `2 px` left gutter bar · muted teal marking the user's own Draft and messages in a thread, plus prompt query matches and choice keys.
+- search match · opaque `oklch(35.0% 0.085 85)` background highlight under the text's own color (at least `4:1` for both `reading text` and `marked`), also the selection, since a `/` match is selected · makes `/` and `?` matches stand out clearly inside both agent prose and muted-teal user messages.
 - keys in motion · `oklch(82.0% 0.125 185)` · font color only (never a background pill) for `INS` mode and active keyboard hints.
 - choice value · `oklch(66.0% 0.120 135)` · the value attached to a choice, not its name or key.
 - point · `oklch(78.0% 0.012 95)` · where the user's attention is in the editor, and marks that guide the eye through text.
@@ -22,11 +22,12 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - seam · `oklch(32.0% 0.018 150)` · a crisp `1 px` square boundary (`oklch(27.8% 0.016 150)` for soft internal dividers).
 - command strip · reading surface lifted slightly (`oklch(25.4% 0.019 150)`) · the area that takes a question, choice, or stuck draft.
 - behind the sheet · black at `35%` opacity · the screen is still there but the phone menu is taking the tap.
+- behind the prompt · black at `60%` opacity · the laptop screen is still there while the prompt panel takes the keys.
 
 ## token type
 - editor text · Rho Font (monospace), `15 px`, weight `400` · one crisp grid from the work to the prompt and top ears.
 - reading rhythm · `1.54` times the editor text size (`Balanced`) · comfortable breathing room for reading long threads.
-- emphasis · weight `650–700` · make the page title, unread name, `INS` mode, or menu title findable without making it larger.
+- emphasis · weight `650–700` · make an unread name, `INS` mode, or menu title findable without making it larger. Page heading titles stay at weight `400`: `title` color alone sets them apart.
 - private aside · italic · the user's own remark rather than a turn in the exchange.
 - thumb icon · `18 px` · recognize the action before reading its word.
 - thumb label · `11 px` · confirm which action the icon will take.
@@ -34,6 +35,8 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 ## token space
 - corner radius · `0 px` · sharp square corners on every bar, border, notch mask, code block, table, and callout.
 - top line · `32–34 px` · global top overlays only: center square black notch mask (`~210 px`, toggleable via `toggle notch mask`) and framed Top-Right Global Status Bar (right of notch to window edge). Screen content owns `100%` of the window from `y = 0`, reserving space for those overlays (raw guest surfaces start below the `32 px` top row with a quiet rho title row at top-left).
+- top gap · `14 px` · air between the `top line` and row 1 of a screen's sheet (laptop `sheet::page` screens and `desk.Desk`; the phone layout has none).
+- heading edge · a screen's top-left heading starts on its sheet's left edge (where the sheet's words start), clamped to `reading inset` on narrow windows, and is cut a `same band gap` before the notch mask.
 - sheet measure · `128 ch` centered · gives a calm side margin on a 13"–14" display while keeping Draft, prose, gutter bars, code blocks, diffs, tables, and images on one straight left vertical edge.
 - prose measure · `80 ch` · wraps conversational prose, quotes, and private replies inside the `128 ch` sheet while letting code blocks, diffs, markdown tables, push cards, and images flow to the full `128 ch` sheet width.
 - same band gap · `12 px` · separate items inside each top ear.
@@ -41,11 +44,11 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - seam width · `1 px` · crisp square boundary for the Right Ear global status bar and soft internal dividers.
 - command strip breath · `2 px` above and below · keep prompt and menu close to the text rhythm.
 - stuck draft shadow · `4 px` down, `12 px` blur, black at `35%` · separate the draft from the history below its seam without dimming the draft.
-- draft gutter stroke · `2 px` teal left gutter bar beside every line of the thread draft and user messages · keeps the left edge fixed while distinguishing user voice from agent voice.
+- draft gutter stroke · `2 px` teal left gutter bar beside every line of the thread draft and user messages, with `10 px` of air before the first letter (a `12 px` sheet gutter) · keeps the left edge fixed while distinguishing user voice from agent voice.
 - thumb target · `56 px` high · an action the thumb can hit at the bottom edge or in a menu sheet.
 - narrow window · up to `600 px` wide · make room for thumb controls rather than using a desktop overlay.
 - row air · two text spaces · leave space between a row name and its words.
-- prompt panel · `104 ch` upper-third floating square panel (`0 px` corners, `1 px` `seam` border, dimmed backdrop behind) · brings `Places`, `Commands`, and `:snooze` into natural eye line without jumping to the bottom edge.
+- prompt panel · `104 ch` floating square panel with its top at `y = 92 px` (`58 px` below the `top line`), on a lifted `oklch(27.6% 0.020 150)` surface with a crisp `1 px` `oklch(38.0% 0.020 150)` border, a lit `oklch(48.0% 0.025 150)` top edge, and a deep shadow (`18 px` down, `44 px` blur, black at `72%`) over the screen dimmed by black at `60%` · brings `Places`, `Commands`, and `:snooze` into natural eye line without jumping to the bottom edge.
 - prompt answers · up to eight visible rows · keep the answer being considered in sight without making a second screen.
 
 ## token time
@@ -59,7 +62,7 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 ## part Status line
 decided: 2026-11-26 · no frame-owned left ear; active screen content fills 100% from y=0 and reserves space for only two global top overlays — center square `#000` notch mask (~210px × 32px) and full-width square-bordered Top-Right Global Status Bar (echo, host exceptions, waiting lamp, quiet NOR / font-color-only teal INS with no pill)
 purpose: keep global rho status (echo, degraded hosts, waiting lamp, mode) in the free top-right space next to the laptop's physical notch without adding a full-width chrome bar or stealing vertical pixels from the screen's own content.
-looks: the active screen fills 100% of the window from `y = 0` and owns the top-left zone beside the notch for its own content (page title, project/count, page markers — omitting model name and redundant `waits · 4m` on `chat.Thread`; `agents.Transcript` puts its model name there). Over the top edge (`32–34 px`, `0 px` radius), the frame paints only:
+looks: the active screen fills 100% of the window from `y = 0` and owns the top-left zone beside the notch for its own content, starting on its sheet's left edge (`heading edge`): page title in `title` at weight `400`, project/count, page markers — omitting model name and redundant `waits · 4m` on `chat.Thread`; `agents.Transcript` puts its model name there). Over the top edge (`32–34 px`, `0 px` radius), the frame paints only:
 - **Center (notch mask):** a solid `notch mask` (`#000000`) square rectangle (`~210 px`) framing the physical top-center camera notch with crisp `0 px` square corners. Can be toggled off manually via `toggle notch mask` in `window.Commands` (when off, the black rectangle disappears cleanly).
 - **Top-Right Global Status Bar:** fills from the right edge of the notch mask to the right window edge on `global status surface` with crisp `1 px` `seam` borders on its left and bottom edges (`0 px` radius); holds the `Echo line` (which temporarily hides quiet notices during its `echo life` so it has full room), active dealer focus (`focus tide` / `quiet 32m` in `quiet`), exception-only host notices (`<host> away` in `quiet`, `<host> needs you` in `lost connection`), the steady `attention` waiting lamp `●`, and the mode word (`NOR` in `quiet`, `INS` in bold `keys in motion` font color only — never a background pill).
 states:
@@ -83,10 +86,10 @@ used on: `window.Screen`, including `chat.Thread` and `desk.Desk`.
 captures: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
-decided: 2026-11-27 · Desk is a pure view-only 1-line tabular glance inside 128ch (no cursor, no row selection; row 1 = Card 1, count in Desk's top-left title row, no subheader; columns: subject · exception tag · project · quiet right age; host away stays in Top-Right Global Status Bar only); Places and Commands live inside the upper-third 104ch square prompt panel with keys shown quietly flush-right
+decided: 2026-11-27 · Desk is a pure view-only 1-line tabular glance inside a 92ch table (no cursor, no row selection; row 1 = Card 1, count in Desk's top-left title row, no subheader; columns: subject · exception tag · project · quiet right age; host away stays in Top-Right Global Status Bar only); Places and Commands live inside the upper-third 104ch square prompt panel with keys shown quietly flush-right
 purpose: let the user glance at waiting work on Desk or pick a place, command, or snooze time cleanly in tabular alignment.
 looks: one row of `editor text` (`0 px` corners).
-- on `desk.Desk`: pure view-only tabular glance laid out inside the `128 ch` centered sheet starting immediately at row 1 (`desk · N wait` sits in Desk's own top-left title row beside the notch; `away` hosts stay in the Top-Right Global Status Bar — never repeated inside the Desk body). Each waiting card is one crisp tabular row: subject (truncated only if needed), optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project address, and right-aligned `quiet` age (`3.0h`). **No text cursor and no row-selection highlight** — the user glances and presses `space-j`, `i`, `space f`, `tab`, or `:` (clicking/tapping a row opens it directly). `and N more · …` sits quietly below the visible rows.
+- on `desk.Desk`: pure view-only tabular glance laid out inside a `92 ch` centered table starting at row 1 after the `top gap` (`desk · N wait` sits in Desk's own top-left title row beside the notch, on the table's left edge; `away` hosts stay in the Top-Right Global Status Bar — never repeated inside the Desk body). Each waiting card is one crisp tabular row: subject (truncated only if needed), optional exception tag (`approve push` in `attention`, a stop such as `failed` or `3 stopped` in `failed`, `away` in `quiet`), right-aligned `quiet` project address, and right-aligned `quiet` age (`3.0h`). **No text cursor and no row-selection highlight** — the user glances and presses `space-j`, `i`, `space f`, `tab`, or `:` (clicking/tapping a row opens it directly). `and N more · …` sits quietly below the visible rows.
 - on `window.Places`: inside the upper-third `104 ch` square prompt panel; columns show clean subject/name (never raw temp paths for visited transcripts), `attention` card words or `quiet` latest words (or matched text snippet for full-text search), `quiet` project/kind, and flush-right key sequence if the place has a shortcut. Query matches use `marked`; the highlighted prompt row uses `current answer` fill with a `2 px` left `keys in motion` bar.
 - on `window.Commands`: inside the upper-third `104 ch` square prompt panel; lists **every** action in rho (including `deal next`, `close and deal`, `done`, `mute`, `unmute`, `snooze thread`, `snooze note`, `unsnooze thread`, `unsnooze note`, `approve push`, `deny push`, `undo`, `open places`, `open desk`, `close screen`, `show messages`, `toggle notch mask`). Each row shows flat verb-noun command name in `reading text`, visually distinct parsed inline target/argument (or live resolved snooze timestamp preview), live target/current value in `quiet` / `choice value`, and its key sequence quietly flush-right. Query matches use `marked`.
 states:
@@ -108,9 +111,9 @@ used on: `agents.Transcript`. In `chat.Thread` the voice is told by colour, see 
 form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Message` for the separate thread form.
 
 ## part Message
-decided: 2026-11-26 · agent is primary unmarked reading voice (bright unread, softer read); user is muted teal with 2px left gutter bar; right-aligned ages (amber unread, quiet older); 128ch centered sheet with 80ch prose wrap and full-sheet code/diffs/tables/images; no date separators, no history folding
+decided: 2026-11-27 · agent is primary unmarked reading voice in one calm `reading text` (no unread/read split); user is muted teal with 2px left gutter bar and 10px of air; right-aligned ages all `quiet`; 128ch centered sheet with 80ch prose wrap and full-sheet code/diffs/tables/images; no date separators, no history folding
 purpose: let the user read an exchange and know who said what immediately, with nothing between messages but clean space.
-looks: laid out inside the `sheet measure` (`128 ch` centered). Prose paragraphs, quotes, and private replies wrap at `prose measure` (`80 ch`); code blocks, diffs, markdown tables, push cards, and images expand across the full `128 ch` sheet on the same straight left edge (`0 px` corners). The project/agent's message is the primary unmarked reading voice (`unread text` when unread since the user's last reply, softer `reading text` once read) with no bar; the user's own message uses muted teal (`marked`) with a `2 px` teal bar in the left gutter beside every line. Each turn's relative age sits flush-right on its first line (`attention` amber on unread turns, `quiet` on older turns). No date separator rows and no collapsed history folds. A `quiet` name line appears above a message from a third voice (or agent short code when multiple agents speak live); `· edited` or `· taken back` sits in `quiet` at the end of the prose.
+looks: laid out inside the `sheet measure` (`128 ch` centered). Prose paragraphs, quotes, and private replies wrap at `prose measure` (`80 ch`); code blocks, diffs, markdown tables, push cards, and images expand across the full `128 ch` sheet on the same straight left edge (`0 px` corners). The project/agent's message is the primary unmarked reading voice, in `reading text` whether read or not, with no bar; the user's own message uses muted teal (`marked`) with a `2 px` teal bar in the left gutter beside every line and `10 px` of air before the words. Each turn's relative age sits flush-right on its first line in `quiet`; the card, not the age, says that the thread wants the user. No date separator rows and no collapsed history folds. A `quiet` name line appears above a message from a third voice (or agent short code when multiple agents speak live); `· edited` or `· taken back` sits in `quiet` at the end of the prose.
 states:
 - flash: a `chat.Flash` in `quiet`, its age in `quiet` flush-right on its first line; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
 - sending: the user's words in `quiet` until the host has the message.
@@ -145,9 +148,9 @@ used on: `chat.Thread` and the draft of `chat.Write an idea`.
 form: [empty reply](design/laptop-card.png), [empty idea with the project runtime](design/laptop-idea-empty.png), [idea with an explicit runtime on phone](design/phone-idea-runtime.png), and a stuck reply with new message on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
 
 ## part Prompt
-decided: 2026-11-27 · upper-third floating 104ch square panel (0px corners, 1px seam border, dimmed screen AND dimmed Left Ear behind while framed Right Ear stays bright); Menu removed completely — space is a silent prefix key with no popup/hint, and space s prefills :snooze thread or :snooze note in this same Prompt
+decided: 2026-11-27 · floating 104ch square panel with its top at y = 92px, lifted above the screen (27.6% surface, 1px seam with a lit top edge, deep shadow) over a 60% black dim of the screen AND its Left Ear while the framed Right Ear stays bright; Menu removed completely — space is a silent prefix key with no popup/hint, and space s prefills :snooze thread or :snooze note in this same Prompt
 purpose: ask for a line of text, pick a place, run any command, or pick a snooze duration in one consistent overlay.
-looks: on desktop, an upper-third floating `prompt panel` (`104 ch` wide, `0 px` corners, `1 px` `seam` border on `global status surface`). Because the borderless Left Ear belongs to the open page/card, opening a prompt dims **both** the screen body and the Left Ear behind it, leaving only the prompt panel and the framed Right Ear global status bar at full brightness. Question/prefix and input line sit at the top separated by a soft `1 px` divider, with selected position/total in `quiet` at the right end, followed by candidate rows below.
+looks: on desktop, a floating `prompt panel` (`104 ch` wide, `0 px` corners, top at `y = 92 px`, lifted surface, crisp border with a lit top edge and a deep shadow). Because the borderless Left Ear belongs to the open page/card, opening a prompt dims **both** the screen body and the Left Ear behind it (`behind the prompt`), leaving only the prompt panel and the framed Right Ear global status bar at full brightness. Question/prefix and input line sit at the top separated by a soft `1 px` divider, with selected position/total in `quiet` at the right end, followed by candidate rows below.
 states:
 - blank query: question/prefix and initial answers (MRU places in `Places`, recent + all commands in `Commands`, or quick duration presets with live resolved timestamps when prefilled with `:snooze thread ` / `:snooze note `).
 - typing: text narrows the list (or previews custom snooze times live); moving the selection keeps the `current answer` among `prompt answers`.

@@ -1863,7 +1863,7 @@ impl Frame {
 
     /// The default top-left corner, drawn in the screen's own layer so a
     /// prompt dims it with the screen.
-    fn render_left_ear(&self, notch: Notch, cx: &App) -> AnyElement {
+    fn render_left_ear(&self, notch: Notch, left: gpui::Pixels, cx: &App) -> AnyElement {
         let colors = cx.theme().colors();
         let LeftEar {
             title,
@@ -1875,7 +1875,7 @@ impl Frame {
             .flex_none()
             .h(px(TOP_ROW_PX))
             .w(notch.start)
-            .pl(px(READING_INSET_PX))
+            .pl(left)
             .pr(px(EAR_GAP_PX))
             .flex()
             .flex_row()
@@ -1886,8 +1886,7 @@ impl Frame {
                 div()
                     .min_w_0()
                     .truncate()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rho_window::style::unread_text_color(cx))
+                    .text_color(rho_window::style::title_color(cx))
                     .child(title),
             )
             .children(context.map(|context| {
@@ -2266,7 +2265,17 @@ impl Render for Frame {
             false => content
                 .flex()
                 .flex_col()
-                .child(self.render_left_ear(notch, cx))
+                .child(self.render_left_ear(
+                    notch,
+                    // On the sheet's left edge, as every screen's own
+                    // heading is.
+                    rho_window::layout::sheet_left(
+                        width,
+                        rho_window::layout::ch(&text_style, window)
+                            * rho_window::layout::SHEET_MAX_CH,
+                    ),
+                    cx,
+                ))
                 .child(div().flex_1().min_h_0().w_full().child(surface.view())),
         };
         let prompt = self.minibuffer.as_ref().map(|minibuffer| {
@@ -2281,7 +2290,7 @@ impl Render for Frame {
                     .absolute()
                     .inset_0()
                     .occlude()
-                    .bg(gpui::black().opacity(0.35))
+                    .bg(gpui::black().opacity(0.60))
                     .on_click(cx.listener(|this, _, window, cx| this.minibuffer_cancel(window, cx)))
                     .into_any_element(),
                 div()

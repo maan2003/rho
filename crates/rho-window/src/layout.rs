@@ -15,13 +15,19 @@ pub const SHEET_MAX_CH: f32 = 128.;
 pub const PROSE_MAX_CH: f32 = 80.;
 /// How wide the floating prompt panel (`Places`, `Commands`) is.
 pub const PROMPT_MAX_CH: f32 = 104.;
+/// How wide the Desk's table is: a narrower sheet, so a row's name and
+/// its state read together.
+pub const DESK_MAX_CH: f32 = 92.;
 /// The black mask over the camera notch, centered on the top row.
 pub const NOTCH_MASK_PX: f32 = 210.;
 /// The top row: the page's identity left of the notch, the global status
 /// bar right of it.
 pub const TOP_ROW_PX: f32 = 34.;
-/// How far the prompt panel floats below the top row.
-pub const PROMPT_GAP_PX: f32 = 10.;
+/// How far the prompt panel floats below the top row: its top at `92 px`,
+/// where the eye rests on the start of the agent's reply.
+pub const PROMPT_GAP_PX: f32 = 58.;
+/// Air between the top row and a sheet's first row.
+pub const TOP_GAP_PX: f32 = 14.;
 /// Breathing room between the window edge and the work.
 pub const READING_INSET_PX: f32 = 24.;
 
@@ -56,6 +62,22 @@ impl Notch {
     }
 }
 
+/// Where a centered sheet `sheet` wide starts in a window `viewport`
+/// wide: a screen's heading starts there too, and never nearer the
+/// window's edge than the reading inset.
+pub fn sheet_left(viewport: Pixels, sheet: Pixels) -> Pixels {
+    ((viewport - sheet) / 2.).max(px(READING_INSET_PX))
+}
+
+/// The room a heading starting at `left` has before the notch, less the
+/// band gap: zero when the sheet starts past it.
+pub fn heading_room(left: Pixels, notch: Notch) -> Pixels {
+    (notch.start - px(BAND_GAP_PX) - left).max(px(0.))
+}
+
+/// `same band gap`: air between items in a top ear, and before the notch.
+pub const BAND_GAP_PX: f32 = 12.;
+
 /// The centered sheet: at most [`SHEET_MAX_CH`] wide, with the reading
 /// inset on either side when the window is narrower than that.
 pub fn sheet(ch: Pixels) -> Div {
@@ -77,5 +99,17 @@ mod tests {
         assert_eq!(laptop.end, px(840.));
         let tiny = Notch::of(px(100.));
         assert_eq!((tiny.start, tiny.end), (px(0.), px(100.)));
+    }
+
+    #[test]
+    fn a_heading_starts_where_the_sheet_does_and_stops_before_the_notch() {
+        let laptop = Notch::of(px(1470.));
+        // A 1100 px sheet on a 1470 px window starts 185 px in.
+        assert_eq!(sheet_left(px(1470.), px(1100.)), px(185.));
+        assert_eq!(heading_room(px(185.), laptop), px(630. - 12. - 185.));
+        // A window narrower than the sheet keeps the reading inset.
+        assert_eq!(sheet_left(px(800.), px(1100.)), px(READING_INSET_PX));
+        // A sheet that starts past the notch leaves the heading no room.
+        assert_eq!(heading_room(px(700.), laptop), px(0.));
     }
 }

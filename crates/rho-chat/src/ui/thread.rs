@@ -162,10 +162,8 @@ enum Class {
     Fold,
     Pending,
     Quote,
-    /// What the project says since the user's last message.
-    Unread,
-    /// What the project said before it, already read.
-    Read,
+    /// The project's words, read or not: one calm voice.
+    Agent,
     /// A private reply: the user's own, seen by no agent.
     Private,
     /// A web link in a message: Enter on it opens it as a page.
@@ -173,7 +171,7 @@ enum Class {
 }
 
 impl Class {
-    const COUNT: usize = 10;
+    const COUNT: usize = 9;
 
     fn slot(self) -> usize {
         match self {
@@ -185,10 +183,9 @@ impl Class {
             Self::Quote => 5,
             // A later slot paints over an earlier one where both apply: a
             // link stays a link in any voice.
-            Self::Unread => 6,
-            Self::Read => 7,
-            Self::Private => 8,
-            Self::Link => 9,
+            Self::Agent => 6,
+            Self::Private => 7,
+            Self::Link => 8,
         }
     }
 }
@@ -206,8 +203,7 @@ impl rho_transcript::Style for Class {
             }
             Self::User => token::marked(),
             Self::Link => token::answer(),
-            Self::Unread => token::unread_text(),
-            Self::Read => token::read_text(),
+            Self::Agent => token::reading_text(),
         };
         HighlightStyle {
             color: Some(color),
@@ -307,8 +303,6 @@ pub struct ThreadView {
     _subscriptions: Vec<Subscription>,
     /// The age each turn shows flush-right on its first line.
     ages: Vec<Age>,
-    /// The words of the project's turns since the user's last message.
-    unread: Vec<Unread>,
     /// The inlays that draw `ages` now.
     age_inlays: Vec<InlayId>,
     /// How many columns of text the sheet holds, as last drawn: where a
@@ -327,29 +321,13 @@ pub struct ThreadView {
 struct Age {
     key: Key,
     at_ms: u64,
-    /// An unread project turn's age asks for the user (`attention`); the
-    /// rest are quiet.
-    unread: bool,
 }
-
-/// A turn the user has not answered yet: the ranges of its text, relative
-/// to its item, that are in the project's voice and no link. They are
-/// painted bright over the item's own read voice, apart from the item, so
-/// that the user's reply dims them without replacing a single item: a
-/// replaced item moves the text the scroll is anchored to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Unread {
-    key: Key,
-    ranges: Vec<Range<usize>>,
-}
-
-/// Above every bucket's keys, so the bright voice paints over the read one.
-const UNREAD_TEXT: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX / 5 * 2);
 
 /// The ages' inlay ids, clear of the draft's.
 const AGE_INLAY_BASE: usize = usize::MAX / 7;
-const LOUD_AGES: HighlightKey = HighlightKey::SyntaxTreeView(KEY_BASE - 1);
-const QUIET_AGES: HighlightKey = HighlightKey::SyntaxTreeView(KEY_BASE - 2);
+/// Every age is quiet: how long a turn waited is context, and the card
+/// already says that the thread wants the user.
+const AGES: HighlightKey = HighlightKey::SyntaxTreeView(KEY_BASE - 2);
 const DRAFT_TEXT: HighlightKey =
     HighlightKey::SyntaxTreeView(rho_window::style::PROMPT_DRAFT_HIGHLIGHT_KEY);
 
@@ -496,6 +474,7 @@ impl ThreadView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
+            rho_notes::sheet::take_gutter(&mut editor, cx);
             draft::stick(&mut editor, "↑ new".into(), cx);
             let doc = editor.buffer().read(cx).snapshot(cx);
             style_draft_in(&mut editor, draft::range(&doc), cx);
@@ -611,7 +590,6 @@ impl ThreadView {
             expanded: Expanded::default(),
             _subscriptions: subscriptions,
             ages: Vec::new(),
-            unread: Vec::new(),
             age_inlays: Vec::new(),
             columns: sheet::SHEET_COLUMNS,
             measure: sheet::Measure::Columns,
@@ -619,10 +597,9 @@ impl ThreadView {
         };
         view.transcript.set_gutter(token::marked_bar_in);
         view.transcript.attach(&view.editor, cx);
-        let (items, ages, unread) = items(system, thread, &view.expanded, None, cx);
+        let (items, ages) = items(system, thread, &view.expanded, None, cx);
         view.transcript.reconcile(items, cx);
         view.ages = ages;
-        view.unread = unread;
         view.paint_ages(cx);
         let end = view.editor.update(cx, |editor, cx| {
             let display = editor.display_snapshot(cx);
@@ -788,7 +765,7 @@ impl ThreadView {
 
     /// The draft is the first excerpt; a history edit cannot move it.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let (items, ages, unread) = items(
+        let (items, ages) = items(
             self.system.read(cx),
             self.thread,
             &self.expanded,
@@ -797,7 +774,6 @@ impl ThreadView {
         );
         self.transcript.reconcile(items, cx);
         self.ages = ages;
-        self.unread = unread;
         self.paint_ages(cx);
         self.schedule_ages(cx);
         cx.notify();
@@ -812,7 +788,7 @@ impl ThreadView {
         let doc = self.document(cx);
         let start = draft::history_start(&doc).row;
         let mut inlays = Vec::new();
-        let (mut loud, mut quiet) = (Vec::new(), Vec::new());
+        let mut highlights = Vec::new();
         for (index, age) in self.ages.iter().enumerate() {
             let Some(range) = self.transcript.range_of(&age.key) else {
                 continue;
@@ -845,67 +821,25 @@ impl ThreadView {
                 inlay_position: anchor,
                 range: pad..pad + words.len(),
             };
-            match age.unread {
-                true => loud.push(highlight),
-                false => quiet.push(highlight),
-            }
+            highlights.push(highlight);
         }
         let ids = (0..inlays.len())
             .map(|index| InlayId::Custom(AGE_INLAY_BASE + index))
             .collect();
         let old = std::mem::replace(&mut self.age_inlays, ids);
-        let to_doc = |offset: usize| {
-            let point = history.offset_to_point(offset);
-            doc.anchor_after(Point::new(start + point.row, point.column))
-        };
-        let unread = self
-            .unread
-            .iter()
-            .filter_map(|unread| {
-                let at = self
-                    .transcript
-                    .range_of(&unread.key)?
-                    .start
-                    .to_offset(&history);
-                Some(
-                    unread
-                        .ranges
-                        .iter()
-                        .map(|range| to_doc(at + range.start)..to_doc(at + range.end))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .flatten()
-            .collect();
         self.editor.update(cx, |editor, cx| {
-            // An inlay's highlight stays until its key is cleared, and an
-            // age that turned quiet would stay loud under the old one.
-            editor.clear_highlights(LOUD_AGES, cx);
-            editor.clear_highlights(QUIET_AGES, cx);
-            editor.highlight_text(
-                UNREAD_TEXT,
-                unread,
+            // An inlay's highlight stays until its key is cleared.
+            editor.clear_highlights(AGES, cx);
+            editor.splice_inlays(&old, inlays, cx);
+            editor.highlight_inlays(
+                AGES,
+                highlights,
                 HighlightStyle {
-                    color: Some(token::unread_text()),
+                    color: Some(token::quiet()),
                     ..HighlightStyle::default()
                 },
                 cx,
             );
-            editor.splice_inlays(&old, inlays, cx);
-            for (key, highlights, color) in [
-                (LOUD_AGES, loud, token::attention()),
-                (QUIET_AGES, quiet, token::quiet()),
-            ] {
-                editor.highlight_inlays(
-                    key,
-                    highlights,
-                    HighlightStyle {
-                        color: Some(color),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-            }
         });
     }
 
@@ -1122,12 +1056,12 @@ fn items(
     expanded: &Expanded,
     private_edit: Option<&PrivateEdit>,
     cx: &App,
-) -> (Vec<Item<Key, Class, Meta>>, Vec<Age>, Vec<Unread>) {
+) -> (Vec<Item<Key, Class, Meta>>, Vec<Age>) {
     let mut items = vec![seam()];
     items.extend(ask_items(system, thread, cx));
-    let (history, ages, unread) = history_items(system, thread, expanded, private_edit, cx);
+    let (history, ages) = history_items(system, thread, expanded, private_edit, cx);
     items.extend(history);
-    (items, ages, unread)
+    (items, ages)
 }
 
 /// The blank line between the draft and the newest item, with a soft
@@ -1206,7 +1140,7 @@ fn ask_items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, C
             let end = start + line.len();
             let class = match line == super::git::HINT {
                 true => Class::Crumb,
-                false => Class::Unread,
+                false => Class::Agent,
             };
             styles.push((class, start..end));
             start = end + 1;
@@ -1232,7 +1166,7 @@ fn history_items(
     expanded: &Expanded,
     private_edit: Option<&PrivateEdit>,
     cx: &App,
-) -> (Vec<Item<Key, Class, Meta>>, Vec<Age>, Vec<Unread>) {
+) -> (Vec<Item<Key, Class, Meta>>, Vec<Age>) {
     let host = thread.host;
     let Some(chat) = system.host_chat(host) else {
         let line = line(
@@ -1240,11 +1174,11 @@ fn history_items(
             "this host's messages are not held here",
             Class::Crumb,
         );
-        return (vec![line], Vec::new(), Vec::new());
+        return (vec![line], Vec::new());
     };
     let Some(head) = chat.thread(thread.message) else {
         let line = line(Key::Unavailable, "this thread is gone", Class::Crumb);
-        return (vec![line], Vec::new(), Vec::new());
+        return (vec![line], Vec::new());
     };
     let mut items = Vec::new();
     // The heading already names the project; the breadcrumb leads back to
@@ -1277,27 +1211,17 @@ fn history_items(
         |agent| agent_tag(system, host, agent, cx),
         |agent| agent_name(system, host, agent, cx),
     );
-    let fresh = unread(&order);
     let mut ages = Vec::new();
-    let mut unread = Vec::new();
     let mut mail_item = |message: &Message| {
         let item = message_item(
             message,
             voices.get(&message.id).map(String::as_str),
             &expanded.quotes,
         )?;
-        let asks = fresh.contains(&message.id) && message.voice == Voice::Message;
         ages.push(Age {
             key: item.key.clone(),
             at_ms: message.at.0,
-            unread: asks,
         });
-        if asks {
-            unread.push(Unread {
-                key: item.key.clone(),
-                ranges: bright(&item),
-            });
-        }
         Some(item)
     };
     items.extend(pending_items(system, host, thread.message));
@@ -1353,39 +1277,7 @@ fn history_items(
         }
     }
     items.extend(crumb);
-    (without_trailing_gap(items), ages, unread)
-}
-
-/// The parts of a message in the read voice that are no link: what turns
-/// bright while the message is unanswered.
-fn bright(item: &Item<Key, Class, Meta>) -> Vec<Range<usize>> {
-    let links: Vec<_> = item
-        .styles
-        .iter()
-        .filter(|(class, _)| *class == Class::Link)
-        .map(|(_, range)| range.clone())
-        .collect();
-    let mut ranges = Vec::new();
-    for (_, voice) in item
-        .styles
-        .iter()
-        .filter(|(class, _)| *class == Class::Read)
-    {
-        let mut at = voice.start;
-        for link in links
-            .iter()
-            .filter(|link| link.start < voice.end && link.end > voice.start)
-        {
-            if link.start > at {
-                ranges.push(at..link.start);
-            }
-            at = at.max(link.end);
-        }
-        if at < voice.end {
-            ranges.push(at..voice.end);
-        }
-    }
-    ranges
+    (without_trailing_gap(items), ages)
 }
 
 /// The live messages (`chat.the last message stays live`), each with its
@@ -1443,20 +1335,6 @@ fn voices(
         voices.insert(message.id, voice);
     }
     voices
-}
-
-/// The project's turns since the user's last message: what the reader has
-/// not answered yet, in the bright voice with an `attention` age.
-fn unread(order: &[&Message]) -> HashSet<MessageId> {
-    let since = order
-        .iter()
-        .rposition(|message| message.from == Party::User && message.voice == Voice::Message)
-        .map_or(0, |last| last + 1);
-    order[since..]
-        .iter()
-        .filter(|message| message.from != Party::User)
-        .map(|message| message.id)
-        .collect()
 }
 
 /// One group per author, independent of edit versions and display state.
@@ -2293,12 +2171,11 @@ fn message_item(
         styles.push((Class::Crumb, 0..text.len()));
         lines.push(Meta::Mail(message.id, None));
     }
-    // The project's words are in the read voice here; while unanswered
-    // they are painted bright over it ([`Unread`]).
+    // The project's words, in its one voice.
     let voice = match (message.from, message.voice) {
         (Party::User, _) => Class::User,
         (_, Voice::Flash) => Class::Time,
-        _ => Class::Read,
+        _ => Class::Agent,
     };
     // Prose wraps at the prose measure; a wide block (code, a diff, a
     // table) keeps its lines whole on the same left edge, for the sheet's
@@ -3008,13 +2885,13 @@ mod tests {
             ..message.clone()
         };
         let ask = message_item(&ask, None, &HashSet::new()).unwrap();
-        assert_eq!(
-            bright(&ask)
-                .into_iter()
-                .map(|range| &ask.text[range])
-                .collect::<Vec<_>>(),
-            ["See ", " now."],
-            "an unanswered turn is bright around its links, which stay links"
+        let at = ask.text.find(link).unwrap();
+        assert!(
+            ask.styles
+                .iter()
+                .any(|(class, range)| *class == Class::Link && *range == (at..at + link.len())),
+            "a link in the project's voice stays a link: {:?}",
+            ask.styles
         );
     }
 
@@ -4878,7 +4755,7 @@ mod tests {
         assert!(
             item.styles
                 .iter()
-                .any(|(class, bytes)| *class == Class::Read && bytes.contains(&proof)),
+                .any(|(class, bytes)| *class == Class::Agent && bytes.contains(&proof)),
             "{:?}",
             item.styles
         );

@@ -6177,7 +6177,13 @@ impl EditorElement {
     fn gutter_highlight_geometry(&self, layout: &EditorLayout, cx: &App) -> (Pixels, Pixels) {
         let compact_gutter = layout.position_map.snapshot.show_compact_gutter;
         let image_gutter = layout.position_map.snapshot.has_gutter_images;
-        let highlight_width = if compact_gutter || image_gutter {
+        let highlight_width = if compact_gutter
+            && layout.position_map.snapshot.compact_gutter_width.is_some()
+        {
+            // A gutter the host sized holds a bar as wide as the one a
+            // stuck excerpt draws.
+            px(2.)
+        } else if compact_gutter || image_gutter {
             (layout.position_map.em_advance * 0.125).max(px(1.))
         } else {
             0.275 * layout.position_map.line_height

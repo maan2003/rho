@@ -1003,7 +1003,8 @@ impl Minibuffer {
                 .children(missing)
                 .into_any_element(),
             // The square panel: the question over a soft divider, then the
-            // answers, on the global status surface with a crisp seam.
+            // answers, lifted above the dimmed screen on a crisp seam with
+            // a lit top edge and a deep shadow.
             crate::Layout::Desktop => div()
                 .id("rho-prompt")
                 .key_context("RhoMinibuffer")
@@ -1011,16 +1012,24 @@ impl Minibuffer {
                 .flex()
                 .flex_col()
                 .w(width)
-                .bg(rho_window::style::global_status_surface(cx))
-                .border_1()
-                .border_color(colors.border)
+                .bg(rho_window::style::prompt_panel_surface())
+                .border_x_1()
+                .border_b_1()
+                .border_color(rho_window::style::prompt_panel_seam())
                 .shadow(vec![gpui::BoxShadow {
-                    color: gpui::black().opacity(0.35),
-                    offset: gpui::point(px(0.), px(4.)),
-                    blur_radius: px(12.),
+                    color: gpui::black().opacity(0.72),
+                    offset: gpui::point(px(0.), px(18.)),
+                    blur_radius: px(44.),
                     spread_radius: px(0.),
                     inset: false,
                 }])
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(1.))
+                        .w_full()
+                        .bg(rho_window::style::prompt_panel_top_seam()),
+                )
                 .text_color(colors.text)
                 .font_family(text_style.font_family.clone())
                 .font_weight(text_style.font_weight)

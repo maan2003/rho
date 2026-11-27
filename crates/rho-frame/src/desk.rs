@@ -9,7 +9,10 @@ use gpui::prelude::*;
 use gpui::{App, Context, FocusHandle, Focusable, SharedString, WeakEntity, Window, div, px};
 use rho_dealer::Address;
 use rho_dealer::rank::{Card, CardKind, Hand};
-use rho_window::layout::{Notch, READING_INSET_PX, SHEET_MAX_CH, TOP_ROW_PX};
+use rho_window::layout::{
+    BAND_GAP_PX, DESK_MAX_CH, Notch, READING_INSET_PX, TOP_GAP_PX, TOP_ROW_PX, heading_room,
+    sheet_left,
+};
 use theme::ActiveTheme as _;
 
 use crate::frame::Frame;
@@ -38,12 +41,47 @@ struct DeskRow {
     key: DeskKey,
     subject: String,
     /// `approve push`, `3 stopped`, `away`.
-    tag: Option<String>,
+    tag: Option<Tag>,
     project: String,
     /// `3.0h`, as the card's words say it.
     age: String,
     flash: Option<String>,
     card: Address,
+}
+
+/// A row's exception, in the colour of what it asks: a push to approve
+/// asks for the user, a stop did not finish, and an away host is calm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tag {
+    words: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    /// `attention`.
+    Approve,
+    /// `failed`.
+    Stop,
+    /// `quiet`.
+    Away,
+}
+
+impl Tone {
+    fn color(self, cx: &App) -> gpui::Hsla {
+        match self {
+            Self::Approve => rho_window::style::attention_color(cx),
+            Self::Stop => rho_window::style::failed_color(cx),
+            Self::Away => cx.theme().colors().text_muted.into(),
+        }
+    }
+}
+
+impl DeskRow {
+    #[cfg(test)]
+    fn tag_words(&self) -> Option<&str> {
+        self.tag.as_ref().map(|tag| tag.words.as_str())
+    }
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -142,13 +180,16 @@ fn age_of(card: &Card) -> String {
 
 /// Why a card is an exception rather than a plain wait: a push to approve
 /// or a stop. A card cached from a host that is away says `away`.
-fn tag_of(card: &Card, away: bool) -> Option<String> {
-    match card.kind {
-        CardKind::Approve(what) => Some(format!("approve {what}")),
-        CardKind::Stop(word) => Some(word.to_owned()),
-        CardKind::Waits | CardKind::Due | CardKind::Other => None,
-    }
-    .or_else(|| away.then(|| "away".to_owned()))
+fn tag_of(card: &Card, away: bool) -> Option<Tag> {
+    let (words, tone) = match card.kind {
+        CardKind::Approve(what) => (format!("approve {what}"), Tone::Approve),
+        CardKind::Stop(word) => (word.to_owned(), Tone::Stop),
+        CardKind::Waits | CardKind::Due | CardKind::Other if away => {
+            ("away".to_owned(), Tone::Away)
+        }
+        CardKind::Waits | CardKind::Due | CardKind::Other => return None,
+    };
+    Some(Tag { words, tone })
 }
 
 pub(crate) fn desk_rows(
@@ -218,7 +259,10 @@ pub(crate) fn desk_rows(
             {
                 row.subject = std::mem::take(&mut row.project);
                 let reason = if mixed { "stops" } else { reason };
-                row.tag = Some(format!("{count} {reason}"));
+                row.tag = Some(Tag {
+                    words: format!("{count} {reason}"),
+                    tone: Tone::Stop,
+                });
                 row.flash = None;
             }
             row
@@ -281,7 +325,6 @@ impl DeskView {
             let colors = cx.theme().colors();
             (colors.text, colors.text_muted)
         };
-        let warning = cx.theme().status().warning;
         let subjects: Vec<_> = self
             .rows
             .waiting
@@ -297,11 +340,12 @@ impl DeskView {
                             .text_color(text)
                             .child(first_line(&row.subject).to_owned()),
                     )
-                    .children(
-                        row.tag
-                            .clone()
-                            .map(|tag| div().flex_none().text_color(warning).child(tag)),
-                    )
+                    .children(row.tag.as_ref().map(|tag| {
+                        div()
+                            .flex_none()
+                            .text_color(tag.tone.color(cx))
+                            .child(tag.words.clone())
+                    }))
             })
             .collect();
         let mut right = |column: &str, cell: fn(&DeskRow) -> &str| {
@@ -362,8 +406,11 @@ impl DeskView {
         let colors = cx.theme().colors();
         let card = row.card.clone();
         let extra = match &row.tag {
-            Some(tag) => Some((tag.clone(), cx.theme().status().warning)),
-            None => row.flash.clone().map(|words| (words, colors.text_muted)),
+            Some(tag) => Some((tag.words.clone(), tag.tone.color(cx))),
+            None => row
+                .flash
+                .clone()
+                .map(|words| (words, colors.text_muted.into())),
         };
         div()
             .id(SharedString::from(format!("desk-row-{}", row.card)))
@@ -487,27 +534,35 @@ impl Render for DeskView {
                     .children(overflow),
             );
         }
-        let sheet = (viewport - px(READING_INSET_PX) * 2.).min(ch * SHEET_MAX_CH);
+        let sheet = (viewport - px(READING_INSET_PX) * 2.).min(ch * DESK_MAX_CH);
+        let left = sheet_left(viewport, sheet);
         let rows = self.sheet(cx);
         // On a laptop the Desk's name and count are its top-left corner,
-        // left of the notch; row 1 starts right under it.
+        // left of the notch, on the table's own left edge.
         let heading = div()
             .flex_none()
             .h(px(TOP_ROW_PX))
-            .w(Notch::of(viewport).start)
-            .pl(px(READING_INSET_PX))
+            .pl(left)
             .flex()
             .items_center()
-            .gap(px(12.))
+            .gap(px(BAND_GAP_PX))
             .overflow_hidden()
             .child(
                 div()
                     .flex_none()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rho_window::style::unread_text_color(cx))
-                    .child(self.title(cx)),
-            )
-            .child(count);
+                    .max_w(heading_room(left, Notch::of(viewport)))
+                    .flex()
+                    .gap(px(BAND_GAP_PX))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rho_window::style::title_color(cx))
+                            .child(self.title(cx)),
+                    )
+                    .child(count),
+            );
         root.child(heading).child(
             div()
                 .id("desk-sheet")
@@ -515,6 +570,7 @@ impl Render for DeskView {
                 .min_h_0()
                 .w(sheet)
                 .mx_auto()
+                .mt(px(TOP_GAP_PX))
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
@@ -664,7 +720,7 @@ mod tests {
             .map(|row| {
                 (
                     row.subject.as_str(),
-                    row.tag.as_deref(),
+                    row.tag_words(),
                     row.project.as_str(),
                     row.age.as_str(),
                 )
@@ -684,6 +740,21 @@ mod tests {
                 ("idea 5", Some("failed"), "unformatted channel", "12m"),
                 // A card that is no wait says no age.
                 ("idea 6", None, "unformatted channel", ""),
+            ]
+        );
+        // Each exception is in the colour of what it asks.
+        let tones = rows
+            .waiting
+            .iter()
+            .map(|row| row.tag.as_ref().map(|tag| tag.tone))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tones,
+            [
+                Some(Tone::Away),
+                Some(Tone::Approve),
+                Some(Tone::Stop),
+                None
             ]
         );
     }
@@ -763,12 +834,12 @@ mod tests {
         let rows = desk_rows(&hand, project, |_| None, nowhere);
         assert_eq!(rows.wait_count, 14);
         assert_eq!(rows.waiting[0].subject, "reef@lab");
-        assert_eq!(rows.waiting[0].tag.as_deref(), Some("2 failed"));
+        assert_eq!(rows.waiting[0].tag_words(), Some("2 failed"));
         assert_eq!(rows.waiting[0].card, address(7));
         assert_eq!(rows.waiting[1].card, address(85));
         assert_eq!(rows.waiting[1].project, "reef@lab");
         assert_eq!(rows.waiting[6].card, address(44));
-        assert_eq!(rows.waiting[6].tag.as_deref(), Some("3 stops"));
+        assert_eq!(rows.waiting[6].tag_words(), Some("3 stops"));
         let overflow = rows.overflow.unwrap();
         assert_eq!(overflow.first, address(12));
         assert_eq!(

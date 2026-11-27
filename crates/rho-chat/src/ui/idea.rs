@@ -807,6 +807,7 @@ impl IdeaView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
+            rho_notes::sheet::take_gutter(&mut editor, cx);
             Self::style_words(&mut editor, cx);
             editor
         });
@@ -1008,7 +1009,7 @@ impl Render for IdeaView {
             .update(cx, |editor, cx| editor.style(cx).text.clone());
         // The header lines start on the words' left edge, after the half
         // column where the words' bar is drawn.
-        let gutter = sheet::column_width(&text, window) * 0.5;
+        let gutter = sheet::GUTTER;
         let line = |context: &'static str, label: &'static str, field: &Entity<Editor>| {
             div()
                 .key_context(context)
@@ -1022,7 +1023,7 @@ impl Render for IdeaView {
                 .child(div().flex_1().child(field.clone()))
         };
         // The words wrap at the prose measure, on the sheet's left edge.
-        let words = sheet::column_width(&text, window) * (sheet::PROSE_COLUMNS as f32 + 1.5);
+        let words = sheet::measure_width(&text, window, sheet::PROSE_COLUMNS);
         let body = div()
             .size_full()
             .flex()

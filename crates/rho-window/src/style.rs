@@ -159,8 +159,8 @@ fn agent_message_color(cx: &App) -> Hsla {
     cx.theme().colors().terminal_ansi_cyan.into()
 }
 
-/// `unread text`: the newest words and the page's own title.
-pub fn unread_text_color(cx: &App) -> Hsla {
+/// `title`: a page heading's title, a step brighter than the text.
+pub fn title_color(cx: &App) -> Hsla {
     cx.theme().colors().terminal_bright_foreground.into()
 }
 
@@ -179,6 +179,26 @@ pub fn keys_in_motion_color(cx: &App) -> Hsla {
 /// `attention`: something to act on, such as the waiting lamp.
 pub fn attention_color(cx: &App) -> Hsla {
     cx.theme().status().warning.into()
+}
+
+fn oklch(l: f32, c: f32, h: f32) -> Hsla {
+    gpui::Color::oklch(l, c, h, 1.).into()
+}
+
+/// `prompt panel`: the floating `Places` and `Commands` panel, lifted
+/// above the dimmed screen (bundled dark appearance).
+pub fn prompt_panel_surface() -> Hsla {
+    oklch(0.276, 0.020, 150.)
+}
+
+/// The prompt panel's crisp `1 px` edge.
+pub fn prompt_panel_seam() -> Hsla {
+    oklch(0.380, 0.020, 150.)
+}
+
+/// The prompt panel's top edge, a step lighter, as if lit from above.
+pub fn prompt_panel_top_seam() -> Hsla {
+    oklch(0.480, 0.025, 150.)
 }
 
 /// `notch mask`: the camera notch's own black, whatever the theme, so the

@@ -84,6 +84,7 @@ impl NoteView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
+            crate::sheet::take_gutter(&mut editor, cx);
             editor.set_placeholder_text("a note · its first line is its title", window, cx);
             editor
         });
@@ -241,7 +242,7 @@ impl Render for NoteView {
         }
         // A note is prose: its words wrap at the prose measure, on the
         // sheet's left edge.
-        let words = sheet::column_width(&text, window) * (sheet::PROSE_COLUMNS as f32 + 1.5);
+        let words = sheet::measure_width(&text, window, sheet::PROSE_COLUMNS);
         let body = div().size_full().max_w(words).child(self.editor.clone());
         div()
             .capture_any_mouse_down(cx.listener(Self::tap_text))

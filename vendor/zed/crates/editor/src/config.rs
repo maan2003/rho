@@ -139,6 +139,12 @@ impl Editor {
         cx.notify();
     }
 
+    /// How wide the compact gutter is; `None` is half a character.
+    pub fn set_compact_gutter_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>) {
+        self.compact_gutter_width = width;
+        cx.notify();
+    }
+
     pub fn set_show_vertical_scrollbar(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_scrollbars.vertical = show;
         cx.notify();
