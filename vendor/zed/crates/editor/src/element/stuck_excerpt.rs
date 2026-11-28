@@ -307,11 +307,11 @@ impl EditorElement {
                     // the band below them is tone only.
                     StuckEdge::Top => {
                         if let Some((_, color)) = panel.gutter.first() {
-                            let (left, _) = self.gutter_highlight_geometry(layout, cx);
+                            let (left, width) = self.gutter_highlight_geometry(layout, cx);
                             window.paint_quad(fill(
                                 Bounds::new(
-                                    point(left.round(), panel.text.bounds.top()),
-                                    size(px(2.), panel.text.bounds.size.height),
+                                    point(left, panel.text.bounds.top()),
+                                    size(width, panel.text.bounds.size.height),
                                 ),
                                 *color,
                             ));

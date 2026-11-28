@@ -20,6 +20,16 @@ impl Editor {
         cx.notify();
     }
 
+    /// Soft-wraps lines at `limit` at most, however wide the editor is: a
+    /// reading measure narrower than the editor, whose width stays free
+    /// for what is painted beside the text, such as end-of-line hints.
+    pub fn set_soft_wrap_limit(&mut self, limit: Option<Pixels>, cx: &mut Context<Self>) {
+        if self.soft_wrap_limit != limit {
+            self.soft_wrap_limit = limit;
+            cx.notify();
+        }
+    }
+
     pub fn set_hard_wrap(&mut self, hard_wrap: Option<usize>, cx: &mut Context<Self>) {
         self.hard_wrap = hard_wrap;
         cx.notify();

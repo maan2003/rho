@@ -9,16 +9,16 @@ use std::sync::Arc;
 use editor::display_map::ToDisplayPoint as _;
 use editor::scroll::Autoscroll;
 use editor::{
-    Anchor, Editor, EditorEvent, EditorMode, HighlightKey, Inlay, InlayHighlight, SelectionEffects,
+    Anchor, Editor, EditorEvent, EditorMode, EolHintRenderer, HighlightKey, SelectionEffects,
     SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, KeyBinding, MouseButton,
-    MouseDownEvent, Subscription, Task, TextStyleRefinement, Window, actions, div,
+    MouseDownEvent, Pixels, Subscription, Task, TextStyleRefinement, Window, actions, div,
 };
 use jiff::Timestamp;
-use language::{Buffer, BufferEvent, Capability, InlayId, Point, ToOffset as _, ToPoint as _};
+use language::{Buffer, BufferEvent, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId, Revision, UnixMs, Voice,
@@ -303,16 +303,16 @@ pub struct ThreadView {
     _subscriptions: Vec<Subscription>,
     /// The age each turn shows flush-right on its first line.
     ages: Vec<Age>,
-    /// The inlays that draw `ages` now.
-    age_inlays: Vec<InlayId>,
-    /// How many columns of text the sheet holds, as last drawn: where a
-    /// flush-right age ends.
-    columns: usize,
-    /// How wide the history's text is, in those columns.
-    measure: sheet::Measure,
-    /// Reads the thread again when an age next changes.
+    /// Draws the ages again when one of them next reads another.
     _ages: Option<Task<()>>,
+    /// How wide the editor was when last laid out, which narrows the
+    /// wrap on a window too narrow for the prose measure and an age.
+    width: Option<Pixels>,
 }
+
+/// How wide the ages' margin past the wrap edge is, in columns: air after
+/// a full line and the widest age, `59m`.
+const AGE_COLUMNS: f32 = 6.;
 
 /// A turn's relative age, drawn flush-right on its first line and not part
 /// of its text: a yank or a quote of the line never carries it, and it
@@ -323,11 +323,6 @@ struct Age {
     at_ms: u64,
 }
 
-/// The ages' inlay ids, clear of the draft's.
-const AGE_INLAY_BASE: usize = usize::MAX / 7;
-/// Every age is quiet: how long a turn waited is context, and the card
-/// already says that the thread wants the user.
-const AGES: HighlightKey = HighlightKey::SyntaxTreeView(KEY_BASE - 2);
 const DRAFT_TEXT: HighlightKey =
     HighlightKey::SyntaxTreeView(rho_window::style::PROMPT_DRAFT_HIGHLIGHT_KEY);
 
@@ -508,13 +503,6 @@ impl ThreadView {
             editor
         });
         let subscriptions = vec![
-            // Inline code's backticks are hidden once the history is
-            // parsed, and the lines the ages follow grow shorter.
-            cx.subscribe(&buffer, |view, _, event: &BufferEvent, cx| {
-                if matches!(event, BufferEvent::Reparsed) {
-                    view.paint_ages(cx);
-                }
-            }),
             cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::SelectionsChanged { local: true }) {
                     let editor = editor.read(cx);
@@ -590,10 +578,8 @@ impl ThreadView {
             expanded: Expanded::default(),
             _subscriptions: subscriptions,
             ages: Vec::new(),
-            age_inlays: Vec::new(),
-            columns: sheet::SHEET_COLUMNS,
-            measure: sheet::Measure::Columns,
             _ages: None,
+            width: None,
         };
         view.transcript.set_gutter(token::marked_bar_in);
         view.transcript.attach(&view.editor, cx);
@@ -601,6 +587,7 @@ impl ThreadView {
         view.transcript.reconcile(items, cx);
         view.ages = ages;
         view.paint_ages(cx);
+        view.hang_lines(cx);
         let end = view.editor.update(cx, |editor, cx| {
             let display = editor.display_snapshot(cx);
             let end = draft::range(display.buffer_snapshot()).end;
@@ -776,84 +763,52 @@ impl ThreadView {
         self.ages = ages;
         self.paint_ages(cx);
         self.schedule_ages(cx);
+        self.hang_lines(cx);
         cx.notify();
     }
 
-    /// Draws each turn's age flush-right on its first line, at the sheet's
-    /// right edge, or two columns after a line too long for that, and the
-    /// unanswered turns' words bright.
+    /// Draws each turn's age flush-right on its first line, in the margin
+    /// just past the wrap edge, so every age stands in one column. An age
+    /// is an end-of-line hint rather than text: a yank, a motion or the
+    /// wrap never meets it, and it reads the clock each time the editor
+    /// draws.
     fn paint_ages(&mut self, cx: &mut Context<Self>) {
-        let now = Timestamp::now();
         let history = self.transcript.buffer().read(cx).snapshot();
         let doc = self.document(cx);
         let start = draft::history_start(&doc).row;
-        let mut inlays = Vec::new();
-        let mut highlights = Vec::new();
-        for (index, age) in self.ages.iter().enumerate() {
-            let Some(range) = self.transcript.range_of(&age.key) else {
-                continue;
-            };
-            let row = range.start.to_point(&history).row;
-            let len = history.line_len(row);
-            // The line as drawn: without the marks its syntax hides.
-            let (from, to) = (
-                Point::new(row, 0).to_offset(&history),
-                Point::new(row, len).to_offset(&history),
-            );
-            let mut line = String::new();
-            let mut at = from;
-            for hidden in history.concealed_ranges(from..to, from..to) {
-                line.extend(history.text_for_range(at..hidden.start.max(at)));
-                at = at.max(hidden.end.min(to));
-            }
-            line.extend(history.text_for_range(at..to));
-            let words = ago(age.at_ms, now);
-            let pad = self.measure.pad(&line, &words, self.columns, cx);
-            let anchor = doc.anchor_after(Point::new(start + row, len));
-            let id = AGE_INLAY_BASE + index;
-            inlays.push(Inlay::custom(
-                id,
-                anchor,
-                format!("{}{words}", " ".repeat(pad)),
-            ));
-            let highlight = InlayHighlight {
-                inlay: InlayId::Custom(id),
-                inlay_position: anchor,
-                range: pad..pad + words.len(),
-            };
-            highlights.push(highlight);
-        }
-        let ids = (0..inlays.len())
-            .map(|index| InlayId::Custom(AGE_INLAY_BASE + index))
+        let text = self
+            .editor
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let (font, size, height) = (text.font(), text.font_size, text.line_height);
+        let hints = self
+            .ages
+            .iter()
+            .filter_map(|age| {
+                let range = self.transcript.range_of(&age.key)?;
+                let row = range.start.to_point(&history).row;
+                let anchor = doc.anchor_after(Point::new(start + row, 0));
+                let at_ms = age.at_ms;
+                let font = font.clone();
+                let render: EolHintRenderer = Arc::new(move |_, _| {
+                    div()
+                        .font(font.clone())
+                        .text_size(size)
+                        .line_height(height)
+                        .text_color(token::quiet())
+                        .whitespace_nowrap()
+                        .child(ago(at_ms, Timestamp::now()))
+                        .into_any_element()
+                });
+                Some((anchor, render))
+            })
             .collect();
-        let old = std::mem::replace(&mut self.age_inlays, ids);
-        self.editor.update(cx, |editor, cx| {
-            // An inlay's highlight stays until its key is cleared.
-            editor.clear_highlights(AGES, cx);
-            editor.splice_inlays(&old, inlays, cx);
-            editor.highlight_inlays(
-                AGES,
-                highlights,
-                HighlightStyle {
-                    color: Some(token::quiet()),
-                    ..HighlightStyle::default()
-                },
-                cx,
-            );
-        });
+        self.editor
+            .update(cx, |editor, cx| editor.set_eol_hints(hints, cx));
     }
 
-    /// The sheet holds `columns` of text measured so now: the ages move to
-    /// its new right edge.
-    fn set_columns(&mut self, columns: usize, measure: sheet::Measure, cx: &mut Context<Self>) {
-        if self.columns != columns || self.measure != measure {
-            self.columns = columns;
-            self.measure = measure;
-            self.paint_ages(cx);
-        }
-    }
-
-    /// Reads the thread again when an age it shows next says another.
+    /// Draws the ages again when the first of them next reads another:
+    /// they change in place, and the thread and the point stay as they
+    /// are (`design.The ages catch up`).
     fn schedule_ages(&mut self, cx: &mut Context<Self>) {
         let now = UnixMs::now().0;
         let wait = self
@@ -865,9 +820,32 @@ impl ThreadView {
             let wait = std::time::Duration::from_millis(wait);
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
-                let _ = this.update(cx, |view, cx| view.refresh(cx));
+                let _ = this.update(cx, |view, cx| {
+                    view.editor.update(cx, |_, cx| cx.notify());
+                    view.schedule_ages(cx);
+                });
             })
         });
+    }
+
+    /// A list item or a quote that wraps keeps its words on one left
+    /// edge: each line it wraps to starts under the words after its
+    /// marker, in the draft and the history alike.
+    fn hang_lines(&mut self, cx: &mut Context<Self>) {
+        let doc = self.document(cx);
+        let mut ranges = Vec::new();
+        for row in 0..=doc.max_point().row {
+            let end = Point::new(row, doc.line_len(multi_buffer::MultiBufferRow(row)));
+            let line: String = doc.text_for_range(Point::new(row, 0)..end).collect();
+            if let Some(indent) = sheet::hanging_indent(&line) {
+                ranges.push((
+                    doc.anchor_before(Point::new(row, 0))..doc.anchor_after(end),
+                    indent,
+                ));
+            }
+        }
+        self.editor
+            .update(cx, |editor, cx| editor.set_hanging_indents(ranges, cx));
     }
 
     fn subscribe_draft(draft: &Entity<Buffer>, cx: &mut Context<Self>) -> Subscription {
@@ -875,6 +853,7 @@ impl ThreadView {
             if matches!(event, BufferEvent::Edited { .. }) {
                 let text = draft.read(cx).text();
                 view.style_draft(cx);
+                view.hang_lines(cx);
                 let thread = view.thread;
                 view.system.update(cx, |system, _| {
                     system.set_draft(thread.host, Some(thread.message), text);
@@ -891,6 +870,7 @@ impl ThreadView {
         self.draft = draft;
         self.draft_point = None;
         self.style_draft(cx);
+        self.hang_lines(cx);
     }
 
     fn style_draft(&self, cx: &mut App) {
@@ -2156,10 +2136,8 @@ fn message_item(
         (_, Voice::Flash) => Class::Time,
         _ => Class::Agent,
     };
-    // Prose wraps at the prose measure; a wide block (code, a diff, a
-    // table) keeps its lines whole on the same left edge, for the sheet's
-    // width to hold.
-    let blocks = sheet::blocks(&body);
+    // The words as written: the editor wraps them at the measure.
+    let source: Vec<&str> = body.lines().collect();
     let push = |text: &mut String, lines: &mut Vec<Meta>, line: &str, meta: Meta| {
         if !lines.is_empty() {
             text.push('\n');
@@ -2167,13 +2145,9 @@ fn message_item(
         text.push_str(line);
         lines.push(meta);
     };
-    let wrapped = |line: &str, prose: bool| match prose {
-        true => sheet::wrap_line(line, sheet::PROSE_COLUMNS),
-        false => vec![line.to_owned()],
-    };
     let mut at = 0;
-    while at < blocks.len() {
-        let (line, prose) = blocks[at];
+    while at < source.len() {
+        let line = source[at];
         let first_line = at;
         at += 1;
         // Where this line's words start, after the newline that ends the
@@ -2185,41 +2159,34 @@ fn message_item(
                 first_line,
             };
             let expanded = expanded_quotes.contains(&quote);
-            let mut quoted = vec![(first_line, line, prose)];
-            while blocks
-                .get(at)
-                .is_some_and(|(line, _)| line.starts_with("> "))
-            {
-                quoted.push((at, blocks[at].0, blocks[at].1));
+            let mut quoted = vec![(first_line, line)];
+            while source.get(at).is_some_and(|line| line.starts_with("> ")) {
+                quoted.push((at, source[at]));
                 at += 1;
             }
             let more = quoted.len() > 1;
             if !expanded {
                 quoted.truncate(1);
             }
-            for (source_line, quoted, prose) in quoted {
-                for piece in wrapped(quoted, prose) {
-                    push(
-                        &mut text,
-                        &mut lines,
-                        &piece,
-                        Meta::Quote(quote, source_line),
-                    );
-                }
+            for (source_line, quoted) in quoted {
+                push(
+                    &mut text,
+                    &mut lines,
+                    quoted,
+                    Meta::Quote(quote, source_line),
+                );
             }
             if more && !expanded {
                 text.push_str(" …");
             }
             styles.push((Class::Quote, start..text.len()));
         } else {
-            for piece in wrapped(line, prose) {
-                push(
-                    &mut text,
-                    &mut lines,
-                    &piece,
-                    Meta::Mail(message.id, Some(first_line)),
-                );
-            }
+            push(
+                &mut text,
+                &mut lines,
+                line,
+                Meta::Mail(message.id, Some(first_line)),
+            );
             styles.push((voice, start..text.len()));
         }
     }
@@ -2525,20 +2492,35 @@ impl Render for ThreadView {
             .editor
             .update(cx, |editor, cx| editor.style(cx).text.clone());
         let heading = self.page_heading(cx);
+        // Everything wraps at the prose measure (`design.prose measure`).
+        // The ages stand in a margin just past it, and a window too narrow
+        // for both narrows the wrap rather than the margin.
+        let column = sheet::column_width(&text, window);
+        let prose = sheet::prose_width(&text, window);
+        let ages = column * AGE_COLUMNS;
+        let limit = self
+            .width
+            .map_or(prose, |width| prose.min(width - sheet::GUTTER - ages));
+        self.editor.update(cx, |editor, cx| {
+            editor.set_soft_wrap_limit(Some(limit), cx);
+            editor.set_eol_hint_column(ages, cx);
+        });
         let this = cx.weak_entity();
-        let measured = text.clone();
         let editor = div()
             .size_full()
             .child(self.editor.clone())
             .on_children_prepainted(move |bounds, window, cx| {
-                let Some(bounds) = bounds.first() else {
+                let Some(width) = bounds.first().map(|bounds| bounds.size.width) else {
                     return;
                 };
-                let measure = sheet::Measure::of(&measured, window);
-                let columns = measure.columns_in(bounds.size.width);
                 let this = this.clone();
                 window.defer(cx, move |_, cx| {
-                    let _ = this.update(cx, |view, cx| view.set_columns(columns, measure, cx));
+                    let _ = this.update(cx, |view, cx| {
+                        if view.width != Some(width) {
+                            view.width = Some(width);
+                            cx.notify();
+                        }
+                    });
                 });
             });
         let page = sheet::page_with_canopy(&heading, &text, editor, &self.editor, window, cx);
@@ -2692,7 +2674,33 @@ mod tests {
         (window, db, [a, b])
     }
 
-    /// The document's lines as drawn, ages and all.
+    /// The lines that carry an age, as their words read.
+    fn aged_lines(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<rho_frame::Frame>,
+    ) -> Vec<String> {
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, _, cx| {
+                let editor = frame.current_surface().editor(cx).unwrap();
+                editor.update(cx, |editor, cx| {
+                    let doc = editor.buffer().read(cx).snapshot(cx);
+                    editor
+                        .eol_hints()
+                        .iter()
+                        .map(|(anchor, _)| {
+                            let row = anchor.to_point(&doc).row;
+                            let end =
+                                Point::new(row, doc.line_len(multi_buffer::MultiBufferRow(row)));
+                            doc.text_for_range(Point::new(row, 0)..end).collect()
+                        })
+                        .collect()
+                })
+            })
+            .unwrap()
+    }
+
+    /// The document's lines as drawn.
     fn display_lines(
         cx: &mut gpui::TestAppContext,
         window: gpui::WindowHandle<rho_frame::Frame>,
@@ -2759,21 +2767,24 @@ mod tests {
                 .any(|tag| two[older - 1].starts_with(tag.as_str())),
             "an answered message is the project's: {two:#?}"
         );
-        // The posts are from 2025: their ages are in days, flush-right on
-        // each turn's first line, the name line when it has one.
-        let aged = |start: &str| {
-            two.iter().any(|line| {
-                line.starts_with(start)
-                    && line.ends_with('d')
-                    && line.chars().count() >= sheet::SHEET_COLUMNS - 2
-            })
-        };
-        assert!(aged("Run the suite once more."), "{two:#?}");
-        assert!(aged(&tags[0]), "{two:#?}");
+        // Each turn's age is on its first line, the name line when it
+        // has one, and outside the text: no line as drawn carries it.
+        let aged = aged_lines(cx, window);
+        assert!(
+            aged.iter().any(|line| line == "Run the suite once more."),
+            "{aged:#?}"
+        );
+        assert!(aged.iter().any(|line| line == &tags[0]), "{aged:#?}");
+        assert!(
+            !aged
+                .iter()
+                .any(|line| line == "Both clock tests pass 500/500."),
+            "the words below a name line have no age of their own: {aged:#?}"
+        );
         assert!(
             two.iter()
-                .any(|line| line == "Both clock tests pass 500/500."),
-            "the words below a name line have no age of their own: {two:#?}"
+                .all(|line| !line.ends_with('d') || line.is_empty()),
+            "no age is part of the text: {two:#?}"
         );
     }
 
@@ -2827,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn prose_wraps_at_the_measure_and_wide_blocks_keep_their_lines() {
+    fn a_message_keeps_its_lines_as_written_for_the_editor_to_wrap() {
         let long = "word ".repeat(30);
         let code = format!("let x = \"{}\";", "c".repeat(100));
         let body = format!("{}\n```rust\n{code}\n```\nDone.", long.trim_end());
@@ -2838,23 +2849,13 @@ mod tests {
         );
         let item = message_item(&message, None, &HashSet::new()).unwrap();
         let lines: Vec<_> = item.text.lines().collect();
-        assert!(
-            lines[0].chars().count() <= sheet::PROSE_COLUMNS,
-            "{lines:#?}"
-        );
-        assert!(
-            lines[0].chars().count() > sheet::PROSE_COLUMNS - 5,
-            "{lines:#?}"
-        );
-        assert_eq!(
-            lines[1].split_whitespace().count(),
-            30 - lines[0].split_whitespace().count()
-        );
-        assert_eq!(lines[3], code, "the code line is whole");
+        // No newline is added: a long line stays one line, which the
+        // editor soft-wraps at the measure the window gives it.
+        assert_eq!(lines, body.lines().collect::<Vec<_>>());
         assert_eq!(
             item.lines.iter().map(Meta::source_line).collect::<Vec<_>>(),
-            [Some(0), Some(0), Some(1), Some(2), Some(3), Some(4)],
-            "each wrapped line maps to the line it came from"
+            [Some(0), Some(1), Some(2), Some(3), Some(4)],
+            "each line maps to the line it came from"
         );
         let link = "https://example.com/x";
         let ask = Message {

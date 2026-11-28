@@ -1023,7 +1023,7 @@ impl Render for IdeaView {
                 .child(div().flex_1().child(field.clone()))
         };
         // The words wrap at the prose measure, on the sheet's left edge.
-        let words = sheet::measure_width(&text, window, sheet::PROSE_COLUMNS);
+        let words = sheet::prose_editor_width(&text, window);
         let body = div()
             .size_full()
             .flex()

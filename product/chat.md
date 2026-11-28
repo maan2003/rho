@@ -133,11 +133,11 @@ rejected:
 A thread (and the `desk.Desk` new-thread canvas) has one draft on each device, not shared with other devices.
 
 ## screen Thread
-decided: 2026-11-28 · subject and quiet tags/actors in Thread's top-left title row (no model name, no waits·age; muted / snoozed until … / approve push / working / stopped shown when active), Draft on row 1 with no placeholder, 128ch centered sheet with 80ch prose wrap and full-sheet code/diffs/tables/images, Mono + Balanced, 0px square corners
+decided: 2026-11-28 · subject and quiet tags/actors in Thread's top-left title row (no model name, no waits·age; muted / snoozed until … / approve push / working / stopped shown when active), Draft on row 1 with no placeholder, 128ch centered sheet with everything soft-wrapped at 80ch and ages in one column past it, Mono + Balanced, 0px square corners
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject, any quiet tags/actors (`:rho`, `:roboman`), and any active page marker (`muted`, `snoozed until …`, `approve push`, `working`, `stopped by you`, `stuck`) in Thread's top-left title row beside the notch (omitting redundant `waits · age` and model name, which lives in `agents.Transcript`)
-- inside a `128 ch` centered sheet (`80 ch` wrap for prose/quotes/private replies; full `128 ch` width for code blocks, diffs, markdown tables, push cards, and images):
+- inside a `128 ch` centered sheet (every line, code and tables too, soft-wraps at `80 ch`; the ages stand just past that edge):
 - the `Draft` first on row 1 (no `reply` placeholder, `2 px` teal left gutter bar, space alone below), or stuck to the top edge while the user reads history below
 - any pending staged push/fetch approval right below the draft (naming repo, refs, force-push dropped count, commits, bounded diff, and `space a approves · space x denies (with draft reply) · space s snoozes`)
 - the `Message` newest first, readable and copyable with the same motions and search as the `Draft`, but not editable; agent messages are the unmarked primary voice (one calm colour, read or not), user messages are muted teal with a `2 px` left gutter bar, and relative ages sit flush-right in `quiet`; no date separators and no collapsed history

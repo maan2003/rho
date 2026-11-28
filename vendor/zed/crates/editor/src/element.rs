@@ -2259,7 +2259,7 @@ impl EditorElement {
     }
 
     /// Lays out end-of-line hints for every visible row that carries
-    /// one: pure paint after the line's content, no display-space
+    /// one: pure paint beside the line's content, no display-space
     /// footprint (see [`Editor::set_eol_hints`]).
     fn layout_eol_hints(
         &self,
@@ -2275,7 +2275,12 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
-        let hints = self.editor.read(cx).eol_hints().to_vec();
+        let editor = self.editor.read(cx);
+        let hints = editor.eol_hints().to_vec();
+        let wrap_width = editor.display_map.read(cx).wrap_width(cx);
+        let column = editor.eol_hint_column;
+        let scroll_x =
+            |x: Pixels| Pixels::from(ScrollPixelOffset::from(x) - scroll_pixel_position.x);
         let mut elements = Vec::new();
         for (anchor, renderer) in hints {
             let anchor_point = anchor.to_point(&snapshot.buffer_snapshot());
@@ -2297,10 +2302,6 @@ impl EditorElement {
             let Some(line_layout) = line_layouts.get(row.minus(start_row) as usize) else {
                 continue;
             };
-            let start_x = Pixels::from(
-                ScrollPixelOffset::from(content_origin.x + line_layout.width)
-                    - scroll_pixel_position.x,
-            ) + em_width;
             let start_y = content_origin.y
                 + line_height
                     * (snapshot.row_y(row.as_f64()) - snapshot.row_y(scroll_position.y)) as f32;
@@ -2309,6 +2310,15 @@ impl EditorElement {
             // height, which is typically shorter than the editor line;
             // center it so the hint sits on the line, not above it.
             let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+            // Flush right at the far side of the margin past the wrap
+            // edge, where the reader's eye finds every hint in one column.
+            // Only a hint wider than the margin can meet its line.
+            let after_line = scroll_x(content_origin.x + line_layout.width) + em_width;
+            let start_x = match wrap_width {
+                Some(wrap_width) => after_line
+                    .max(scroll_x(content_origin.x + wrap_width + column) - size.width),
+                None => after_line,
+            };
             element.prepaint_as_root(
                 point(start_x, start_y + (line_height - size.height) / 2.),
                 AvailableSpace::min_size(),
@@ -6193,13 +6203,13 @@ impl EditorElement {
             layout.content_origin.x + layout.position_map.em_advance * inset
                 - Pixels::from(layout.position_map.scroll_pixel_position.x)
         } else if image_gutter {
-            layout.gutter_hitbox.right()
-                - layout.position_map.em_advance * 0.5
-                - highlight_width
+            layout.gutter_hitbox.right() - layout.position_map.em_advance * 0.5 - highlight_width
         } else {
             layout.gutter_hitbox.left()
         };
-        (highlight_left, highlight_width)
+        // On a whole pixel, so that every bar, inline or stuck, covers
+        // the same device pixels.
+        (highlight_left.round(), highlight_width)
     }
 
     fn paint_gutter_highlight_ranges(
@@ -6213,13 +6223,6 @@ impl EditorElement {
         cx: &App,
     ) {
         let (highlight_left, highlight_width) = self.gutter_highlight_geometry(layout, cx);
-        let highlight_corner_radii = Corners::all(0.05 * layout.position_map.line_height);
-        let editor = self.editor.read(cx);
-        let top_excerpt = editor
-            .stuck_excerpt
-            .as_ref()
-            .filter(|state| state.edge == StuckEdge::Top)
-            .and_then(|_| editor.stuck_excerpt_range(&layout.position_map.snapshot.display_snapshot));
         window.paint_layer(|window| {
             for (range, color) in highlights {
                 let start_row = if range.start.row() < visible_rows.start {
@@ -6245,17 +6248,11 @@ impl EditorElement {
                             * ScrollPixelOffset::from(layout.position_map.line_height)
                             - scroll_y_pixels,
                     );
-                let (highlight_left, highlight_width) =
-                    if top_excerpt.as_ref().is_some_and(|rows| rows.contains(&range.start.row())) {
-                        (highlight_left.round(), px(1.))
-                    } else {
-                        (highlight_left, highlight_width)
-                    };
                 let bounds = Bounds::from_corners(
                     point(highlight_left, start_y),
                     point(highlight_left + highlight_width, end_y),
                 );
-                window.paint_quad(fill(bounds, *color).corner_radii(highlight_corner_radii));
+                window.paint_quad(fill(bounds, *color));
             }
         });
     }
@@ -9580,6 +9577,7 @@ impl Element for EditorElement {
                             } else {
                                 let wrap_width = calculate_wrap_width(
                                     editor.soft_wrap_mode(cx),
+                                    editor.soft_wrap_limit,
                                     editor_width,
                                     em_layout_width,
                                 );
@@ -12607,17 +12605,19 @@ fn register_action_erased(
 /// both full and auto-height editors compute wrap widths consistently.
 fn calculate_wrap_width(
     soft_wrap: SoftWrap,
+    limit: Option<Pixels>,
     editor_width: Pixels,
     em_width: Pixels,
 ) -> Option<Pixels> {
     let wrap_width_for = |column: u32| (column as f32 * em_width).ceil();
 
-    match soft_wrap {
+    let width = match soft_wrap {
         SoftWrap::GitDiff => None,
         SoftWrap::None => Some(wrap_width_for(MAX_LINE_LEN as u32 / 2)),
         SoftWrap::EditorWidth => Some(editor_width),
         SoftWrap::Bounded(column) => Some(editor_width.min(wrap_width_for(column))),
-    }
+    }?;
+    Some(limit.map_or(width, |limit| width.min(limit)))
 }
 
 fn compute_auto_height_layout(
@@ -12654,8 +12654,13 @@ fn compute_auto_height_layout(
     let overscroll = size(em_width, px(0.));
 
     let editor_width = text_width - gutter_dimensions.margin - overscroll.width - em_width;
-    let wrap_width = calculate_wrap_width(editor.soft_wrap_mode(cx), editor_width, em_width)
-        .map(|width| width.min(editor_width));
+    let wrap_width = calculate_wrap_width(
+        editor.soft_wrap_mode(cx),
+        editor.soft_wrap_limit,
+        editor_width,
+        em_width,
+    )
+    .map(|width| width.min(editor_width));
     if wrap_width.is_some() && editor.set_wrap_width(wrap_width, cx) {
         snapshot = editor.snapshot(window, cx);
     }
@@ -15161,27 +15166,46 @@ mod tests {
         let em_width = px(8.0);
 
         assert_eq!(
-            calculate_wrap_width(SoftWrap::GitDiff, editor_width, em_width),
+            calculate_wrap_width(SoftWrap::GitDiff, None, editor_width, em_width),
             None,
         );
 
         assert_eq!(
-            calculate_wrap_width(SoftWrap::None, editor_width, em_width),
+            calculate_wrap_width(SoftWrap::None, None, editor_width, em_width),
             Some(px((MAX_LINE_LEN as f32 / 2.0 * 8.0).ceil())),
         );
 
         assert_eq!(
-            calculate_wrap_width(SoftWrap::EditorWidth, editor_width, em_width),
+            calculate_wrap_width(SoftWrap::EditorWidth, None, editor_width, em_width),
             Some(px(800.0)),
         );
 
         assert_eq!(
-            calculate_wrap_width(SoftWrap::Bounded(72), editor_width, em_width),
+            calculate_wrap_width(SoftWrap::Bounded(72), None, editor_width, em_width),
             Some(px((72.0 * 8.0_f32).ceil())),
         );
         assert_eq!(
-            calculate_wrap_width(SoftWrap::Bounded(200), px(400.0), em_width),
+            calculate_wrap_width(SoftWrap::Bounded(200), None, px(400.0), em_width),
             Some(px(400.0)),
+        );
+
+        // A limit narrows a wide editor's wrap and leaves a narrow one's.
+        assert_eq!(
+            calculate_wrap_width(
+                SoftWrap::EditorWidth,
+                Some(px(640.0)),
+                editor_width,
+                em_width
+            ),
+            Some(px(640.0)),
+        );
+        assert_eq!(
+            calculate_wrap_width(SoftWrap::EditorWidth, Some(px(640.0)), px(400.0), em_width),
+            Some(px(400.0)),
+        );
+        assert_eq!(
+            calculate_wrap_width(SoftWrap::GitDiff, Some(px(640.0)), editor_width, em_width),
+            None,
         );
     }
 
