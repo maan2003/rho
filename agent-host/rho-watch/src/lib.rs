@@ -116,13 +116,19 @@ impl Watcher {
             id,
             seen: HashSet::new(),
         };
-        for path in contents {
-            adding.path(path, true, 0)?;
-        }
-        for path in names {
-            adding.path(path, false, 0)?;
-        }
+        let result = (|| {
+            for path in contents {
+                adding.path(path, true, 0)?;
+            }
+            for path in names {
+                adding.path(path, false, 0)?;
+            }
+            Ok::<(), io::Error>(())
+        })();
+        // A failed registration drops the partially built subscription too;
+        // its cleanup takes this same mutex.
         drop(state);
+        result?;
         Ok(subscription)
     }
 
@@ -338,6 +344,31 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[test]
+    fn failed_subscription_returns_and_releases_partial_watches() {
+        let watcher = Watcher::new().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let paths = (0..=MAX_PATHS)
+            .map(|i| root.path().join(format!("missing-{i}")))
+            .collect::<Vec<_>>();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = watcher.watch([], paths.iter().map(PathBuf::as_path));
+            assert_eq!(result.unwrap_err().to_string(), "too many watched paths");
+            let state = watcher.0.state.lock().unwrap();
+            assert!(state.subscriptions.is_empty());
+            assert!(state.watches.is_empty());
+            drop(state);
+            let subscription = watch(&watcher, &[], &[root.path().join("later")]);
+            std::fs::write(root.path().join("later"), "changed").unwrap();
+            assert!(subscription.changed().unwrap());
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("failed watch registration deadlocked");
+    }
 
     fn watch(watcher: &Watcher, contents: &[PathBuf], names: &[PathBuf]) -> Subscription {
         watcher
