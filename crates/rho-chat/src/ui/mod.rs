@@ -1493,18 +1493,6 @@ impl System for ChatSystem {
     }
 }
 
-/// How long ago, in the deal bar's units.
-pub(crate) fn ago(at_ms: u64, now: Timestamp) -> String {
-    let at = Timestamp::from_millisecond(at_ms as i64).unwrap_or(Timestamp::UNIX_EPOCH);
-    let minutes = now.duration_since(at).as_mins();
-    match minutes {
-        ..=0 => "now".to_owned(),
-        1..60 => format!("{minutes}m"),
-        60..1440 => format!("{}h", minutes / 60),
-        _ => format!("{}d", minutes / 1440),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rho_agent_types::{ProjectMode, Voice};
@@ -1949,15 +1937,5 @@ mod tests {
                 },
             },
         }
-    }
-
-    #[test]
-    fn ago_reads_in_the_bars_units() {
-        let now = Timestamp::from_millisecond(10_000_000_000).unwrap();
-        let ms = |mins: i64| (now - jiff::SignedDuration::from_mins(mins)).as_millisecond() as u64;
-        assert_eq!(ago(ms(0), now), "now");
-        assert_eq!(ago(ms(5), now), "5m");
-        assert_eq!(ago(ms(130), now), "2h");
-        assert_eq!(ago(ms(3000), now), "2d");
     }
 }

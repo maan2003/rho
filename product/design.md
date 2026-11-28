@@ -7,8 +7,8 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - notch mask · `#000000` · solid square black rectangle framing the physical top-center notch so it reads as crisp square geometry.
 - reading text · `oklch(70.9% 0.012 95)` · every agent turn and body text, read or unread, in one calm OKSolar voice (no brightness split between unread and read).
 - title · `oklch(78.0% 0.012 95)` at the text's own weight · a page heading's title, one step brighter than the text.
-- quiet · `oklch(56.0% 0.012 110)` · context that can wait: every turn age, settled things, Desk's `away` tag, host tags, calm `away` host notes in the Top-Right Global Status Bar, `NOR` mode, and hints.
-- attention · `oklch(79.5% 0.145 78)` · something to act on: pending push approval (`approve push` in the thread title row or ambient Desk accent) or `↑ new` in a stuck draft canopy. Never a turn age; no `●` waiting lamp.
+- quiet · `oklch(56.0% 0.012 110)` · context that can wait: settled things, Desk's `away` tag, host tags, calm `away` host notes in the Top-Right Global Status Bar, `NOR` mode, and hints.
+- attention · `oklch(79.5% 0.145 78)` · something to act on: pending push approval (`approve push` in the thread title row or ambient Desk accent) or `↑ new` in a stuck draft canopy. No `●` waiting lamp.
 - lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach (`needs you`, or an `away` host required by the open screen).
 - failed · `oklch(75.0% 0.145 25)` · a step that did not finish successfully.
 - answer · `oklch(78.0% 0.105 230)` · links and short explanatory notices (`oklch(74.0% 0.130 145)` for positive echoes).
@@ -36,8 +36,8 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - top line · `32–34 px` · global top overlays only: center square black notch mask (`~210 px`, toggleable via `toggle notch mask`) and the borderless Top-Right Global Status Bar (right of notch to window edge, on the screen's own surface). Screen content owns `100%` of the window from `y = 0`, reserving space for those overlays (raw guest surfaces start below the `32 px` top row with a quiet rho title row at top-left).
 - top gap · `14 px` · air between the `top line` and row 1 of a screen's sheet (laptop `sheet::page` screens and `desk.Desk`; the phone layout has none).
 - heading edge · a screen's top-left heading starts on its sheet's left edge (where the sheet's words start), clamped to `reading inset` on narrow windows, and is cut a `same band gap` before the notch mask.
-- sheet measure · `128 ch` centered · gives a calm side margin on a 13"–14" display while keeping Draft, text, gutter bars, and images on one straight left vertical edge; in a thread, the width past the `prose measure` holds the ages.
-- prose measure · `80 ch` (a width: 80 times the advance of `0`, about 90 letters of Rho Font prose) · the editor soft-wraps every line of a thread at it, prose, quotes, code blocks, diffs, and tables alike, and the Draft too; message text is never hard-wrapped. A window narrower than the measure and an age's margin wraps narrower.
+- sheet measure · `128 ch` centered · gives a calm side margin on a 13"–14" display while keeping Draft, text, gutter bars, and images on one straight left vertical edge.
+- prose measure · `80 ch` (a width: 80 times the advance of `0`, about 90 letters of Rho Font prose) · the editor soft-wraps every line of a thread at it, prose, quotes, code blocks, diffs, and tables alike, and the Draft too; message text is never hard-wrapped. A window narrower than the measure wraps at its own width.
 - same band gap · `12 px` · separate items inside each top ear.
 - reading inset · `24–28 px` · calm side breathing room from the window edge.
 - seam width · `1 px` · soft internal dividers and the prompt panel's faint edge.
@@ -52,7 +52,7 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 
 ## token time
 - echo life · `4 s` · long enough to see the result of the last action in the Top-Right Global Status Bar (temporarily hiding quiet notices; full history in `show messages`).
-- age beat · `1 min` · refresh elapsed ages on the thread and its list without a ticking clock on every row.
+- age beat · `1 min` · refresh elapsed ages on thread summaries without a ticking clock on every row.
 - card age step · `now` during the first minute, nearest minute thereafter under an hour, tenth of an hour under a day, tenth of a day after that · change the words when the displayed age changes.
 - while needed · event-bound, no fixed duration · the signal or open choice stays while it is true or still takes the next action.
 - cut · immediate, no transition · hand the keys or the line to the newly active thing.
@@ -107,11 +107,11 @@ used on: `agents.Transcript`. In `chat.Thread` the voice is told by colour, see 
 form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Message` for the separate thread form.
 
 ## part Message
-decided: 2026-11-27 · agent is primary unmarked reading voice in one calm `reading text` (no unread/read split); user is muted teal with 2px left gutter bar and 10px of air; right-aligned ages all `quiet`, in one column just past the wrap edge; 128ch centered sheet, everything soft-wrapped at 80ch (code, diffs and tables too, 2026-11-28); no date separators, no history folding
+decided: 2026-11-27 · agent is primary unmarked reading voice in one calm `reading text` (no unread/read split); user is muted teal with 2px left gutter bar and 10px of air; no ages on messages or flashes (2026-11-28: the user does not use them); 128ch centered sheet, everything soft-wrapped at 80ch (code, diffs and tables too, 2026-11-28); no date separators, no history folding
 purpose: let the user read an exchange and know who said what immediately, with nothing between messages but clean space.
-looks: laid out inside the `sheet measure` (`128 ch` centered). Every line, prose, quotes, private replies, code blocks, diffs, and markdown tables, soft-wraps at `prose measure` (`80 ch`) on the same straight left edge (`0 px` corners); a wrapped list item or quote hangs under the words after its marker. The project/agent's message is the primary unmarked reading voice, in `reading text` whether read or not, with no bar; the user's own message uses muted teal (`marked`) with a `2 px` teal bar in the left gutter beside every line and `10 px` of air before the words. Each turn's relative age sits flush-right on its first line in `quiet`, in a narrow margin just past the wrap edge, so all ages stand in one column and no line reaches them; the card, not the age, says that the thread wants the user. No date separator rows and no collapsed history folds. A `quiet` name line appears above a message from a third voice (or agent short code when multiple agents speak live); `· edited` or `· taken back` sits in `quiet` at the end of the prose.
+looks: laid out inside the `sheet measure` (`128 ch` centered). Every line, prose, quotes, private replies, code blocks, diffs, and markdown tables, soft-wraps at `prose measure` (`80 ch`) on the same straight left edge (`0 px` corners); a wrapped list item or quote hangs under the words after its marker. The project/agent's message is the primary unmarked reading voice, in `reading text` whether read or not, with no bar; the user's own message uses muted teal (`marked`) with a `2 px` teal bar in the left gutter beside every line and `10 px` of air before the words. A message carries no age; the card and `window.Places` say how long a thread waited. No date separator rows and no collapsed history folds. A `quiet` name line appears above a message from a third voice (or agent short code when multiple agents speak live); `· edited` or `· taken back` sits in `quiet` at the end of the prose.
 states:
-- flash: a `chat.Flash` in `quiet`, its age in `quiet` flush-right on its first line; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
+- flash: a `chat.Flash` in `quiet`, with no age; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
 - sending: the user's words in `quiet` until the host has the message.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `chat.Thread`.

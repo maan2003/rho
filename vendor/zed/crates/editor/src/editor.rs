@@ -1291,8 +1291,6 @@ pub struct Editor {
     /// motions, and goal columns never interact with them (neovim's
     /// eol virtual text).
     eol_hints: Vec<(Anchor, EolHintRenderer)>,
-    /// The margin right of the wrap edge that `eol_hints` stand in.
-    eol_hint_column: Pixels,
     #[cfg(feature = "native")]
     blame: Option<Entity<GitBlame>>,
     blame_subscription: Option<Subscription>,
@@ -2863,7 +2861,6 @@ impl Editor {
             blame_subscription: None,
             pending_blame_hover_observation: None,
             eol_hints: Vec::new(),
-            eol_hint_column: Pixels::ZERO,
 
             #[cfg(feature = "native")]
             bookmark_store,
