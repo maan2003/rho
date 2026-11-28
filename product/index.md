@@ -1,10 +1,10 @@
 # rho
 
-rho is the one window where one person works with many AI agents, their Slack, and their own notes. It hands the user the next thing that wants them, lets them write to a project, and gives them a way to look into the work.
+rho is the one window where one person works with many AI agents, their Slack, and their own notes. It hands the user the next thing that wants them, lets them start new work right from a blank desk, and gives them a way to look into the work.
 
 ## user
 
-One person, the only user. They run many projects at once, each with agents working on it, and they read and answer Slack for their work, using their own account in rho's browser.
+One person, the only user. They run many threads of work at once across repositories and swarms of agents, and they read and answer Slack for their work, using their own account in rho's browser.
 
 The laptop is rho. For eight to ten hours a day, everything they do on the laptop happens in this window. They do not come and go. They are here, and they move between places: a thread, a transcript, a terminal, a desktop, a page in the browser, a note. Between two places, they look at what wants them. Sometimes they rest here too.
 
@@ -41,7 +41,7 @@ Anything the user would have to hold in their head between two places, rho holds
 test: Is there anything the user must remember between two places that the product could keep for them? Does this change ever make that memory wrong, or lose it?
 
 ## value One place, in focus
-The user works in one place for an hour at a time, on one of many projects. Every extra thing on the screen costs them attention, and anything that pulls at them from outside the place breaks their work. The lamp is the only pull allowed.
+The user works in one place for an hour at a time, on one of many threads of work. Every extra thing on the screen costs them attention, and anything that pulls at them from outside the place breaks their work. A single gentle chime for active work or a due reminder is the only pull allowed.
 test: Does every thing on this screen help with the step the user is on, and can they stay in this place for an hour without the rest of the world pulling at them?
 
 ## value Rare power, neatly tucked away
@@ -53,7 +53,7 @@ Every screen and every flow is judged from the user's side: is there something t
 test: Is there a step in this flow that the system could do or decide on its own instead of the user?
 
 ## value An editor, not an app
-Every editor screen is text the user moves through with the same keys: the same selections, motions, search, and Helix modes everywhere, select then act (`desk.Desk` is a calm view-only glance rather than an editable buffer). A prompt panel asks, the echo line answers in the Top-Right Global Status Bar, and there are no dialogs or separate places with their own controls. The same keys reach a terminal, a desktop, and a page in the browser.
+Every editor screen is text the user moves through with the same keys: the same selections, motions, search, and Helix modes everywhere, select then act. A prompt panel asks, the echo line answers in the Top-Right Global Status Bar, and there are no dialogs or separate places with their own controls. The same keys reach a terminal, a desktop, and a page in the browser.
 test: Does the new screen work with the same keys, motions, and search as every other screen, without a dialog?
 
 ## value Notes are the user's own
@@ -61,8 +61,8 @@ A note holds only what the user typed. No agent reads it, and the machine never 
 test: After this change, is every word of every note still typed by the user, and still hidden from every agent?
 
 ## value Moving between places costs nothing
-The user changes place hundreds of times a day. Any place is one name away, and the previous place is one gesture away, with nothing lost in the place they left.
-test: Can the user reach this place by name from anywhere, and return in one gesture, with the place they left as it was?
+The user changes place hundreds of times a day. Any place is one name away, and the previous place is one gesture away (except after a batch of cards, when they name the place), with nothing lost in the place they left.
+test: Can the user reach this place by name from anywhere, and return in one gesture (or by name after a batch of cards), with the place they left as it was?
 
 ## value The phone is a full device
 Every flow is possible on the phone. Where the thumb makes a flow longer, that is a cost chosen on purpose and written down, never a flow that the phone cannot do.
@@ -77,8 +77,8 @@ A sidebar, tabs, or other fixed controls around the screen.
 ## non-goal An agent dashboard
 A list or dashboard of agents. Agents are reached one level down from the work, when the user needs to inspect it.
 
-## non-goal Labels, piles, and to-do lists
-Labels, piles, and to-do lists for sorting things. A card is answered with a reply or a verdict and goes away.
+## non-goal Channels, piles, and to-do lists
+Channels with shared history, piles, and to-do lists for manual inbox sorting. Lightweight inline tags (`:rho`, `:roboman`) route work and narrow search without creating a channel feed or sorting pile; a card is answered with a reply or a verdict and goes away.
 
 ## non-goal Settings screens
 Settings screens.

@@ -1,29 +1,29 @@
 # agents
 
-Agents do the work behind a project's messages inside a workset. The user inspects the work in a per-workset transcript and reaches its tools (`Shell`, `Terminal`, `Desktop`) as flat peers of the `chat.Thread` and of each other.
+Agents do the work behind a thread's messages inside a workset. The user inspects the work in a per-workset transcript or live diff (`Change`) and reaches its tools (`Shell`, `Terminal`, `Desktop`) as flat peers of the `chat.Thread` and of each other.
 
 ## bet An agent is labour, not a colleague
 instead of: reaching an individually named agent from each thread.
 serves: Keep the work moving.
-because: the user cares about the work, not the worker. The project speaks for the work, and every per-idea workset, transcript, tool, and prompt is named by `<project> · <thread subject>` (and a standing `one agent` workset simply by `<project>`) rather than opaque agent codes; short codes appear only as a quiet suffix when more than one agent runs in the same workset.
+because: the user cares about the work, not the worker. The thread speaks for the work, and every workset, transcript, diff, tool, and prompt is named by `<thread subject>` (with primary tag when present, such as `rho · Flaky clock test`, or the standing actor's name such as `roboman`) rather than opaque agent codes; short codes appear only as a quiet suffix when more than one agent runs in the same workset.
 costs: the user opens a peer view to see what a particular agent ran.
 
 ## bet Trust by inspection
 instead of: agents that report what they did, which the user believes.
 serves: Keep the work moving.
-because: the user does not edit code by hand and must still know whether a result is right; the result message carries proof, the workset transcript shows how the work was done, and the shell, terminal, and desktop let the user stand beside the work.
-costs: a transcript is long, and the user reads it to find what went wrong.
+because: the user does not edit code by hand and must still know whether a result is right; `Change` (`open diff`) shows the real diff with `>` quoting back into the thread, the workset transcript shows how the work was done, and the shell, terminal, and desktop let the user stand beside the work.
+costs: inspecting a diff or transcript takes a deliberate open when prose proof is not enough.
 
 ## journey An agent in trouble gets back on track
 goal: the user gets the work going again so the result comes.
 starts when: an agent stops or fails.
 steps:
-1. the user opens the project's message about the stop, `deal.Clear what waits`
+1. the user opens the stop message in its thread, `deal.Clear what waits`
 2. the user reads the reason, `chat.Answer a message`
    - when they need more, the user opens the workset transcript, `Look into the work`
-3. the user replies with what the project should do next, `chat.Answer a message`; replying wakes an existing `stopped` or `failed` agent in its own workset and runtime (or retries a refused start using the project's latest place and runtime)
+3. the user replies with what should happen next, `chat.Answer a message`; replying wakes an existing `stopped` or `failed` agent in its own workset and runtime (or retries a refused start using the thread's recorded workspace and runtime)
 4. the user gets the result after the work carries on, `deal.Clear what waits`
-done when: the user sees the project's result.
+done when: the user sees the thread's result.
 day: Keep the work moving.
 
 ## journey Work beside an agent and check it by hand
@@ -37,17 +37,19 @@ done when: the user has verified or fixed the issue and answered the thread.
 day: Reach anything.
 
 ## concept Workset
-purpose: group the work, its transcript, and its tools (`Shell`, `Terminal`, `Desktop`) into one inspectable unit alongside the `chat.Thread`.
-principle: one or more agents work on a flaky test inside a workset; the user opens the workset transcript as a flat peer of the thread, reads the chronological log across the workset (filtering to one agent when needed), or opens its shell or desktop.
-sees: its label (`<project> · <thread subject>` for per-idea worksets, or `<project>` for a standing `one agent` workset), host, folder on the host, active agents and their states (`working`, `waiting`, `failed`, `retrying`, `stopped`, or `archived`), and its full chronological transcript.
+purpose: group the work, its transcript, its live diff (`Change`), and its tools (`Shell`, `Terminal`, `Desktop`) into one inspectable unit alongside the `chat.Thread`.
+principle: one or more agents work on a flaky test inside a workset; the user opens the workset transcript or `Change` diff as a flat peer of the thread, reads the chronological log or changed lines, quotes lines straight into the thread draft, or opens its shell or desktop.
+sees: its label (`<tag> · <thread subject>` or `<thread subject>`), host, folder on the host, active agents and their states (`working`, `waiting`, `failed`, `retrying`, `stopped`, or `archived`), and its full chronological transcript.
 has:
 - many `Agent`
+- one `Change` (when backed by a repository)
 - one `Shell` (experimental)
 - many `Terminal`
 - many `Desktop`
 - many `chat.Thread`, the one it started from first
 does:
-- open `enter` on a project message or `Flash` in `chat.Thread` (or `open transcript` from `window.Commands`): open the workset transcript at the step that wrote the message or flash (or the last error / newest step when opened by command); once visited, the open transcript stays in `window.Places` MRU recents
+- open `enter` on an agent message or `Flash` in `chat.Thread` (or `open transcript` from `window.Commands`): open the workset transcript at the step that wrote the message or flash (or the last error / newest step when opened by command); once visited, the open transcript stays in `window.Places` MRU recents
+- open diff, from `window.Commands` on a repo-backed thread or transcript: open `Change` showing the workset's live diff against its base ref
 - filter transcript, from `window.Commands` on the transcript: narrow the workset transcript to one `Agent`, or clear the filter to show the whole workset
 - open thread, from `window.Commands`: open the `chat.Thread` it started from
 todo:
@@ -74,8 +76,55 @@ todo:
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
-principle: an agent starts on its project's runtime, `opus-high` until the project says otherwise, or on the one the idea's `on:` line named; the user wants a cheaper one for a small piece of work already running, so they type `:model sol-medium` in `window.Commands`.
+principle: an agent starts on the host's default runtime (`opus-high` unless overridden inline with `:model <runtime>`); the user wants a cheaper one for a small piece of work already running, so they type `:model sol-medium` in `window.Commands`.
 sees: a name such as `sol-medium`, `opus-high`, or `fable-high`.
+
+## concept Change
+status: agreed design not built yet; queued to build alongside `open diff`.
+decided: 2026-11-28 · add a dedicated read-only Helix `Change` (`open diff`) outcome view on repo-backed threads with `>` quoting diff lines straight into the thread `chat.Draft`, while keeping staged protected push approvals (`space a` / `space x`) in `chat.Thread`
+purpose: let the user inspect the real code diff produced in a repository workset without wading through tool calls in the transcript or opening a terminal.
+principle: an agent reports that a refactor is ready; the user runs `open diff` from `window.Commands`, reads the unified diff across files in a `128 ch` Helix buffer, selects three questionable lines, presses `>` to quote them (`file:line` + lines) directly into the thread's `chat.Draft`, and replies.
+sees: a summary line of changed files and insertions/deletions at the top of the `128 ch` sheet, followed by the full unified diff against the workset's base ref (with syntax-clear added/removed lines and file headers), readable and searchable with standard Helix motions.
+does:
+- open diff, from `window.Commands` on any repo-backed `chat.Thread` or `Transcript`: open the workset's live `Change` view (refreshes as the workset changes; once visited, stays in `window.Places` MRU recents)
+- jump files or hunks `]f`, `[f`, `]c`, `[c`: move to the next or previous changed file or hunk
+- quote `>` on a selection: insert the selected diff lines with their file path and line range as a `>` quote block into the originating thread's `chat.Draft` and open the thread ready to comment
+
+## screen Change
+status: agreed design not built yet.
+decided: 2026-11-28 · 128ch read-only Helix diff buffer with file/hunk motions and `>` quoting into the thread draft
+answers: what exact code did this workset change?
+shows:
+- top-left title row: `<workset label> · diff` and base ref / file count summary
+- inside the `128 ch` sheet: changed-file summary followed by the unified diff (full `128 ch` width, `0 px` square corners), searchable and copyable with standard Helix motions
+states:
+- empty: `no changes against <base>`
+- loading: `loading diff…` while querying the host
+- partial: large diffs bound very large generated/binary files with a quiet note (`binary` or `truncated · N lines`)
+- error: `<host> away` or `not a git repository`
+- full: full unified diff with file/hunk navigation and `>` quoting into the thread draft
+keys:
+- `]f`, `[f`: next or previous changed file; `]c`, `[c`: next or previous hunk
+- `>`: quote selected diff lines (with file and line context) into the thread's `chat.Draft` and open the thread
+- `space`: silent `window.Screen` prefix (`space f` places, `space u` undo, plus `deal.Verdict` chords on the workset's waiting thread when unambiguous)
+- `space-j` (`ctrl-j`), `tab`, `q`, `:`: `window.Screen`
+starts: `Review the change`
+
+## flow Review the change
+status: agreed design not built yet.
+runs: 10 a day
+day: Keep the work moving.
+when: an agent finishes or proposes a repository change and the user wants to check the actual diff before answering or approving a push
+want: read the exact diff in the editor and comment on specific lines without leaving rho
+so that: the user trusts what merges and gives exact feedback in one gesture
+steps:
+1. from a repo-backed `chat.Thread` or `Transcript`, the user runs `open diff` in `window.Commands`
+2. the user reads and searches the diff with standard Helix motions (`/` search, `]f`/`[f` files, `]c`/`[c` hunks)
+3. if a line needs feedback, the user selects it and presses `>` to quote it (with file path and line numbers) directly into the thread's `chat.Draft` and writes their reply
+4. if everything looks right, the user marks `done` (`space d`) or returns to the thread (`q` / `space f`) to approve any staged push (`space a`)
+system: computes the live diff against the workset's base ref on the host, formats it in a read-only `128 ch` Helix buffer, and attaches file/line context when quoting into the thread's draft.
+user: the review judgement and any quoted feedback.
+cases: clean working tree with commits ahead of base; uncommitted changes in progress; binary or large generated file; host away.
 
 ## concept Shell
 status: experimental.
@@ -101,7 +150,7 @@ sees: the terminal, filling the window; at the top, `<workset label> · term <n>
 does:
 - open terminal, from `window.Commands` anywhere: opens a workset's running terminal (prompting when more than one runs, or starting one when none runs); once visited, it appears in `window.Places` MRU recents (never cluttering global `window.Places` search)
 - new terminal, from `window.Commands` anywhere: start another terminal, numbered after the others
-- type (`INS`): keys go to the terminal, except `escape` (enters rho `NOR`), `physical-escape` (forwards literal `escape` to the terminal), `ctrl-shift-v` (paste), `ctrl-shift-;` (opens `window.Commands`), `ctrl-alt-m` (idea draft), and `space-j` / `space-shift-j` (deal)
+- type (`INS`): keys go to the terminal, except `escape` (enters rho `NOR`), `physical-escape` (forwards literal `escape` to the terminal), `ctrl-shift-v` (paste), `ctrl-shift-;` (opens `window.Commands`), `ctrl-alt-m` (blank new-thread draft), and `space-j` / `space-shift-j` (deal)
 - read (`NOR`): standard `window.Screen` keys (`space` leader for `f` places / `u` undo, `space-j` / `ctrl-j`, `tab`, `q`, `:`) plus scrollback (`j`, `k`, `ctrl-d`, `ctrl-u`, `gg`, `G`), search (`/`, `?`, `n`, `N`), and copy (`y`); `i` or `a` returns to typing
 - scroll with the wheel: move back through old lines, or send the wheel to the program when it asks for it
 
@@ -168,7 +217,7 @@ so that: its work goes on from a good point
 steps:
 1. from anywhere (`chat.Thread`, `Transcript`, `desk.Desk`), the user opens `window.Commands` (`:`) and chooses `cancel agent request`, `stop agent`, `rewind agent`, `rewind agent to here`, `compact agent`, `reset agent cache`, or `set agent runtime` (optionally with an inline target or argument such as `:model sol-medium` or `:stop agent clock`)
    - when one agent is unambiguous from context, the row shows it by default (overridable inline); otherwise a `window.Prompt` asks which agent (by workset label)
-2. if the work needs new instructions, the user writes to the project in `chat.Thread`, `chat.Answer a message`
+2. if the work needs new instructions, the user writes in `chat.Thread`, `chat.Answer a message`
 system: carries the change to the agent's host.
 user: which change, and what to tell it.
 
@@ -185,8 +234,8 @@ system: starts a shell or terminal when none runs, keeps it running after the us
 user: what to type.
 cases: more than one running terminal; the host is on this machine, where desktop does not open; the host drops while typing in the shell.
 
-## rule an idea starts the work in its thread
-when the user sends a `chat.Message` as a new idea to a `chat.Project`, then the work starts in the `chat.Thread` for that idea and the agent reads the idea first. In `one` (`one agent`) mode it is the project's standing agent, started when none runs; in `new` (`per idea`) mode it is a fresh agent in its own workset, as `chat.Project.receive an idea`.
+## rule a new thread starts the work automatically
+when the user sends an opening `chat.Message` via `chat.Start a thread`, then if any standing actor `chat.Token` (`:roboman`, …) is named those actors join and subscribe to the thread; if no standing actor is named, rho starts a fresh isolated agent in its own workset (cloning any `:repo` or repo-bound `:label`, using any `:dir`, or starting in a scratch directory, on any `:model` override or the host default).
 
 ## flow Approve a push or a fetch
 runs: 3 a day
@@ -195,25 +244,25 @@ when: an agent pushes to `main` or `master`, or pushes to / fetches from a repos
 want: see exactly which work asks, where it goes, and what it pushes, right in its thread, and say yes or no when ready — without being interrupted mid-typing or failing after a minute away
 so that: no agent pushes to a protected branch or uses the user's ssh login without their word, denying can carry instructions, and background work does not time out while the user is busy or away
 steps:
-1. the host stages the exact push or fetch intent (target repository, ref changes including force-push dropped count, up to 50 commits, and bounded diff) and surfaces it right at the top of its originating user `chat.Thread` (a child agent's staged push bubbles up to the parent user thread so it never strands in an agent-to-agent thread; a thread the user explicitly muted stays silenced). Lights only the Top-Right Global Status Bar lamp — never popping a modal over what the user is typing
-2. when the user deals or opens the thread, they inspect the repository, ref changes, commits, and diff in full thread context and give `approve` (`space` then `a`, refused if the host is `away`), `deny` (`space` then `x`, opening `:deny push ` prefilled with any current draft text so `enter` confirms), or `snooze` (`space` then `s` → `:snooze thread `); the thread never offers `done` or `mute` while a push/fetch awaits, and `approve`/`deny` are host-visible acting decisions (not undoable with `space u` once executed). Agents may also withdraw their own staged push so a plain reply can resolve it
+1. the host stages the exact push or fetch intent (target repository, ref changes including force-push dropped count, up to 50 commits, and bounded diff) and surfaces it right at the top of its originating user `chat.Thread` (a child agent's staged push bubbles up to the parent user thread so it never strands in an agent-to-agent thread; a thread the user explicitly muted stays silenced). Never pops a modal over what the user is typing; chimes gently only if the thread is live (`< 1h`)
+2. when the user deals or opens the thread, they inspect the repository, ref changes, commits, and diff in full thread context (and can open `Change` via `open diff` if needed) and give `approve` (`space` then `a`, refused if the host is `away`), `deny` (`space` then `x`, opening `:deny push ` prefilled with any current draft text so `enter` confirms), or `snooze` (`space` then `s` → `:snooze thread `); the thread never offers `done` or `mute` while a push/fetch awaits, and `approve`/`deny` are host-visible acting decisions (not undoable with `space u` once executed). Agents may also withdraw their own staged push so a plain reply can resolve it
 system: keeps the user uninterrupted; holds the staged push asynchronously with no 60-second timeout, also while no window is open; executes using the user's ssh login once approved only if Git sets the exact refs and commits shown; takes the pending push away when the agent's git goes away, such as when the agent is stopped. For non-`main`/non-`master` branches on GitHub, a host configured with `GITHUB_TOKEN` may push directly through `octo`, which refuses `main`, `master`, and tags.
 user: the approve or deny decision (plus optional draft instructions on deny).
 cases: two agents request protected pushes at once (two waiting threads in the deal); a push requested while the user is typing in a terminal or while the laptop is shut; denying with "push a branch and open a PR instead"; a push to a repository the user does not recognise.
 rejected:
-- a synchronous 60-second pop-over prompt over whatever screen is active · 2026-11-26 · stole keypresses, broke `One place, in focus` (`The lamp is the only pull allowed`), and always timed out while away
+- a synchronous 60-second pop-over prompt over whatever screen is active · 2026-11-26 · stole keypresses, broke `One place, in focus`, and always timed out while away
 - a standalone push-approval card screen separate from its `chat.Thread`, with `space d` as deny · 2026-11-26 · `space d` collided with 50×/day `done` muscle memory, separated the push from its thread context, and couldn't attach reply instructions to a denial
 
 ## rule a push waits for the user
 when an `Agent` pushes to `main` or `master`, or pushes/fetches through the user's ssh login, then it parks asynchronously at the top of its originating `chat.Thread` until the user explicitly approves (`space a`) or denies (`space x`) it; without approval the push or fetch does not happen. An approved push goes only if Git sets exactly the refs, to exactly the commits, that the thread showed; otherwise it fails and the agent asks again. Feature-branch pushes to GitHub may run unprompted through a host-held `GITHUB_TOKEN` via `octo`, which enforces that only non-`main`/non-`master` branches may be pushed.
 
 ## rule a refused start leaves a message
-when a start cannot use the `chat.Project`'s place before it creates an `Agent`, then the `chat.Thread` keeps a `failed` stop that names the place and the host and says `reply to retry, or change where it works with set project place`. A later start shows its own progress without erasing the stop from history.
+when a start cannot use the requested repository, directory, or host before it creates an `Agent`, then the `chat.Thread` keeps a `failed` stop that names the place and the host and tells the user they can reply to retry (with corrected `:repo` / `:dir` / `:host` tokens if needed). A later start shows its own progress without erasing the stop from history.
 rejected:
-- telling the user to run `start agent here` · 2026-11-21 · no command has that name, and the place belongs to the project
+- telling the user to run `start agent here` · 2026-11-21 · no command has that name
 
 ## rule a stuck agent asks
-when an `Agent` has been retrying its model for three minutes, then its thread says `stuck · can't reach its model` and the age of the retry, and the project sends one stop message. When the model answers again, the project edits that stop and it no longer deals.
+when an `Agent` has been retrying its model for three minutes, then its thread says `stuck · can't reach its model` and the age of the retry, and sends one stop message. When the model answers again, it edits that stop and it no longer deals.
 
 ## rule rewinding takes back its messages
 when `rewind agent` or `rewind agent to here` takes back a turn that wrote message, then the withdrawn message is still readable as `taken back` but no longer deals. Message since changed by another turn is not withdrawn.

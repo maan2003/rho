@@ -7,11 +7,11 @@ The browser is inside the window. A page is a place like a terminal or a desktop
 ## concept Page
 purpose: let the user read and use a web page without leaving the window.
 principle: a message holds a link to a pull request; the user puts the cursor on the link and presses `enter`; the page fills the window in `INS`; they read it, press `escape` to enter rho `NOR`, and press `space` then `f` + `enter` to flip right back to the thread with the cursor where they left it.
-sees: the page, filling the window under the `window.Status line`, which reads `web ›` and the page's title, with `INS` while live and `NOR` when escaped; the lamp still at its right end.
+sees: the page, filling the window under the `window.Status line`, which reads `web ›` and the page's title, with `INS` while live and `NOR` when escaped.
 does:
 - open `enter` on a link in a `chat.Message`: open the link as a page (regardless of Helix selection width); a link that is not a web address echoes that nothing opens it
 - open page, from `window.Commands` (supports inline URL like `:open github.com/…`, or asks `page:` listing open pages by title, most recently visited first): open that page or web address (`https://` assumed); open pages are also searchable in `window.Places`
-- live input (`INS`): type, click, and scroll go to the site; `escape` enters rho `NOR`; `physical-escape` sends literal `escape` to the page; `ctrl-shift-;` opens `window.Commands`; `space-j` / `space-shift-j` deal directly; `ctrl-alt-m` opens an idea draft
+- live input (`INS`): type, click, and scroll go to the site; `escape` enters rho `NOR`; `physical-escape` sends literal `escape` to the page; `ctrl-shift-;` opens `window.Commands`; `space-j` / `space-shift-j` deal directly; `ctrl-alt-m` opens a blank new-thread draft
 - normal (`NOR`): standard `window.Screen` keys (`space` leader for `f` places / `u` undo, `space-j` / `ctrl-j`, `tab` desk, `q` close page, `:` commands); `i` or clicking the page returns to `INS`
 
 A page is never a dealable `deal.Card`; `space` never offers `done`, `mute`, `snooze`, `approve`, or `deny` for a page.
@@ -38,7 +38,7 @@ user: which conversation to answer, and the reply.
 answers: which page is this, and what does it say?
 shows:
 - the current `Page`, filling the reading area, including the site's links and reply fields
-- the `window.Status line` with `web ›` and the page title, true mode (`INS` or `NOR`), and the lamp when something waits elsewhere
+- the `window.Status line` with `web ›` and the page title, and true mode (`INS` or `NOR`)
 - on the phone, the `window.Phone bar` below the page
 states:
 - empty: there is no `Page` screen until a page opens

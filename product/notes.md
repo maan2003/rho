@@ -29,7 +29,7 @@ While the user types a new note, the top line follows its first line as it is ty
 
 ## concept Private reply
 purpose: let the user keep a remark on a `chat.Message` in its thread, where only they see it.
-principle: a project messages a result the user doubts; they press `alt-r` on the message, type their doubt just beneath it and press `escape`. The remark stays there, dim, marked `🔒 you`.
+principle: an agent messages a result the user doubts; they press `alt-r` on the message, type their doubt just beneath it and press `escape`. The remark stays there, dim, marked `🔒 you`.
 sees: directly under the message, `🔒 you · time` and the text, dim and slanted; while writing, a line says `── private · only you see this · escape keeps it`.
 does:
 - reply privately `alt-r` on the message, or `reply privately` from `window.Commands`: start writing beneath it; if the message already has a private reply, edit it there
