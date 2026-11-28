@@ -313,10 +313,7 @@ impl ChatSystem {
         let mut agent = waiting.ask.request.agent?;
         let mut asked = std::collections::BTreeSet::new();
         while asked.insert(agent) {
-            if let Some(message) = chat
-                .working_thread(agent)
-                .filter(|thread| !chat.agent_only(*thread))
-            {
+            if let Some(message) = chat.working_thread(agent) {
                 return Some(ThreadId { host, message });
             }
             agent = self.participant(host, agent, cx)?.parent?;
@@ -926,6 +923,42 @@ pub(super) mod tests {
         assert_eq!(world.hand(cx), ["tide › Next idea · approve fetch · 1m"]);
         world.hears(cx, GitChange::Lost);
         assert!(world.hand(cx).is_empty());
+    }
+
+    /// A tool that wakes an agent opens a root of its own, which only
+    /// agents see (`rho debug send-message`, as the deployer does), and
+    /// the agent joins it. That join is its latest, but its push still
+    /// waits in the thread the user talks to it in: it did not wait
+    /// unseen, where no thread could show it.
+    #[gpui::test]
+    fn a_push_after_an_agent_only_wake_waits_in_the_users_thread(cx: &mut TestAppContext) {
+        let mut world = world(cx);
+        world.tell(cx, |seq| ChatRecord {
+            seq: ChatSeq(seq),
+            at: UnixMs(1_760_000_000_000 + seq),
+            event: ChatEvent::Posted {
+                parent: None,
+                retry_of: None,
+                thread_reply: None,
+                from: Party::User,
+                voice: Voice::Message,
+                content: vec![ContentPart::Text {
+                    text: "Latest main is live".into(),
+                }],
+            },
+        });
+        let wake = MessageId(ChatSeq(world.next - 1));
+        world.tell(cx, |seq| joined(seq, wake, worker()));
+        let _answered = world.asks(cx, 0xd1, push_to(&["refs/heads/main"], Some(worker())), 2);
+        assert_eq!(
+            world.hand(cx),
+            ["tide › Flaky clock test · approve push · 2m"]
+        );
+        // Back in a thread the user sees, the agent's latest join leads.
+        world.tell(cx, |seq| posted(seq, PROJECT, Party::User, "Next idea"));
+        let next = MessageId(ChatSeq(world.next - 1));
+        world.tell(cx, |seq| joined(seq, next, worker()));
+        assert_eq!(world.hand(cx), ["tide › Next idea · approve push · 2m"]);
     }
 
     /// A push from an agent another agent made, which works in their own
