@@ -3,10 +3,11 @@
   "base_keymap": "VSCode",
   "buffer_font_family": "Rho Font",
   "buffer_font_fallbacks": ["Noto Color Emoji"],
-  "buffer_font_size": 15,
-  "buffer_line_height": { "custom": 1.54 },
+  "buffer_font_size": 15.5,
+  "buffer_line_height": { "custom": 1.55 },
   "ui_font_family": "Rho Font",
   "ui_font_fallbacks": ["Noto Color Emoji"],
+  "ui_font_size": 14.5,
   "text_rendering_mode": "grayscale",
   "scrollbar": { "show": "never" },
   "gutter": {

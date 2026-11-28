@@ -23,19 +23,10 @@ pub fn default_settings() -> String {
             .ok()
             .and_then(|value| value.parse().ok())
     };
-    settings_with_font(
-        family.as_deref(),
-        number("RHO_GUI_FONT_SCALE"),
-        number("RHO_GUI_FONT_WEIGHT"),
-    )
-    .to_string()
+    settings_with_font(family.as_deref(), number("RHO_GUI_FONT_WEIGHT")).to_string()
 }
 
-fn settings_with_font(
-    family: Option<&str>,
-    scale: Option<f32>,
-    weight: Option<f32>,
-) -> serde_json::Value {
+fn settings_with_font(family: Option<&str>, weight: Option<f32>) -> serde_json::Value {
     let mut base = settings::parse_json_with_comments(&settings::default_settings())
         .expect("bundled editor defaults are valid JSONC");
     let overrides = serde_json::from_str(include_str!("../assets/settings/rho-defaults.json"))
@@ -44,11 +35,6 @@ fn settings_with_font(
     for prefix in ["buffer_font", "ui_font"] {
         if let Some(family) = family {
             base[&format!("{prefix}_family")] = family.into();
-        }
-        if let Some(scale) = scale {
-            let size = &mut base[&format!("{prefix}_size")];
-            *size =
-                (size.as_f64().expect("default font size is numeric") * f64::from(scale)).into();
         }
         if let Some(weight) = weight {
             base[&format!("{prefix}_weight")] = weight.into();
@@ -132,24 +118,22 @@ mod tests {
 
     #[test]
     fn font_override_replaces_both_defaults() {
-        let settings = settings_with_font(Some("ABC \"Quoted\" Sans"), Some(1.5), Some(300.0));
+        let settings = settings_with_font(Some("ABC \"Quoted\" Sans"), Some(300.0));
         for key in ["buffer_font_family", "ui_font_family"] {
             assert_eq!(settings[key], "ABC \"Quoted\" Sans");
         }
-        assert_eq!(settings["buffer_font_size"].as_f64(), Some(22.5));
-        assert_eq!(settings["ui_font_size"].as_f64(), Some(21.0));
-        assert_eq!(
-            settings["agent_buffer_font_size"], 12,
-            "only two default sizes scale"
-        );
+        // The sizes are rho's own, whatever the font: 31 and 29 device
+        // pixels at the laptop's 2x.
+        assert_eq!(settings["buffer_font_size"].as_f64(), Some(15.5));
+        assert_eq!(settings["ui_font_size"].as_f64(), Some(14.5));
         assert_eq!(settings["buffer_font_weight"].as_f64(), Some(300.0));
         assert_eq!(settings["ui_font_weight"].as_f64(), Some(300.0));
 
-        let unscaled = settings_with_font(Some("ABC Sans"), None, None);
-        assert_eq!(unscaled["buffer_font_size"], 15);
-        assert_eq!(unscaled["ui_font_weight"], 400);
-        let unrenamed = settings_with_font(None, Some(1.5), None);
+        let plain = settings_with_font(Some("ABC Sans"), None);
+        assert_eq!(plain["ui_font_weight"], 400);
+        let unrenamed = settings_with_font(None, None);
         assert_eq!(unrenamed["ui_font_family"], "Rho Font");
+        assert_eq!(unrenamed["buffer_font_size"].as_f64(), Some(15.5));
     }
 
     #[test]

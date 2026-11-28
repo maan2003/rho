@@ -43,7 +43,7 @@ form_gui() {
     mkdir -p "$rig/$client"/{state,config,cache,data}
     form_way "$size" start --width "$width" --height "$height" --scale "$scale" -- \
         dbus-run-session -- env \
-        -u RHO_GUI_FONTS -u RHO_GUI_FONT_FAMILY -u RHO_GUI_FONT_SCALE \
+        -u RHO_GUI_FONTS -u RHO_GUI_FONT_FAMILY \
         -u RHO_GUI_FONT_WEIGHT -u RHO_GUI_FONT_BOLD_WEIGHT \
         XDG_STATE_HOME="$rig/$client/state" XDG_CONFIG_HOME="$rig/$client/config" \
         XDG_CACHE_HOME="$rig/$client/cache" XDG_DATA_HOME="$rig/$client/data" \
