@@ -1617,11 +1617,6 @@ impl DisplayMap {
             .update(cx, |map, cx| map.set_wrap_width(width, cx))
     }
 
-    /// Where lines wrap, from the left edge of the text, if they wrap.
-    pub fn wrap_width(&self, cx: &App) -> Option<Pixels> {
-        self.wrap_map.read(cx).wrap_width()
-    }
-
     /// Sets hanging indents, in space columns, for inclusive anchored source-row ranges.
     /// Ranges must be ascending and nonoverlapping; an empty vector clears all overrides.
     pub fn set_hanging_indents(

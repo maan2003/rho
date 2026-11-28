@@ -2259,7 +2259,7 @@ impl EditorElement {
     }
 
     /// Lays out end-of-line hints for every visible row that carries
-    /// one: pure paint beside the line's content, no display-space
+    /// one: pure paint after the line's content, no display-space
     /// footprint (see [`Editor::set_eol_hints`]).
     fn layout_eol_hints(
         &self,
@@ -2275,12 +2275,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
-        let editor = self.editor.read(cx);
-        let hints = editor.eol_hints().to_vec();
-        let wrap_width = editor.display_map.read(cx).wrap_width(cx);
-        let column = editor.eol_hint_column;
-        let scroll_x =
-            |x: Pixels| Pixels::from(ScrollPixelOffset::from(x) - scroll_pixel_position.x);
+        let hints = self.editor.read(cx).eol_hints().to_vec();
         let mut elements = Vec::new();
         for (anchor, renderer) in hints {
             let anchor_point = anchor.to_point(&snapshot.buffer_snapshot());
@@ -2302,6 +2297,10 @@ impl EditorElement {
             let Some(line_layout) = line_layouts.get(row.minus(start_row) as usize) else {
                 continue;
             };
+            let start_x = Pixels::from(
+                ScrollPixelOffset::from(content_origin.x + line_layout.width)
+                    - scroll_pixel_position.x,
+            ) + em_width;
             let start_y = content_origin.y
                 + line_height
                     * (snapshot.row_y(row.as_f64()) - snapshot.row_y(scroll_position.y)) as f32;
@@ -2310,15 +2309,6 @@ impl EditorElement {
             // height, which is typically shorter than the editor line;
             // center it so the hint sits on the line, not above it.
             let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-            // Flush right at the far side of the margin past the wrap
-            // edge, where the reader's eye finds every hint in one column.
-            // Only a hint wider than the margin can meet its line.
-            let after_line = scroll_x(content_origin.x + line_layout.width) + em_width;
-            let start_x = match wrap_width {
-                Some(wrap_width) => after_line
-                    .max(scroll_x(content_origin.x + wrap_width + column) - size.width),
-                None => after_line,
-            };
             element.prepaint_as_root(
                 point(start_x, start_y + (line_height - size.height) / 2.),
                 AvailableSpace::min_size(),

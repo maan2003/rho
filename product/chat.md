@@ -74,10 +74,10 @@ does:
 - tag / untag thread, from `window.Commands` (or inline `:tokens` / agent instructions): add or remove lightweight labels on the thread
 
 ## concept Message
-decided: 2026-11-27 · agent is primary unmarked reading voice in one calm colour whether read or not, user is muted teal with 2px left gutter bar and 10px of air, right-aligned relative ages all quiet, no date separators, no history folding
+decided: 2026-11-27 · agent is primary unmarked reading voice in one calm colour whether read or not, user is muted teal with 2px left gutter bar and 10px of air, no age on a message (2026-11-28), no date separators, no history folding
 purpose: carry an idea, an ask, or a result in the thread's voice, keep it as the record of the work, and let the user answer in the thread.
 principle: an agent asks a question; the user reads it on top of the thread with earlier words one glance below, and replies without needing to know the writer's name.
-sees: the words, with the voice told by colour and gutter alone: the agent's message as the unmarked primary reading voice (one calm `design.reading text`, read or not), the user's own message in muted teal (`design.marked`) with a `2 px` teal left gutter bar; a flush-right relative age on the first line, always `quiet`; a quiet name line above a message from anyone else (or a quiet agent short code when more than one agent has a live message in the same thread); a quiet tag at the end of the text, such as `edited` or `taken back`; what the message quotes. Never inserts date separator lines or collapses older history.
+sees: the words, with the voice told by colour and gutter alone: the agent's message as the unmarked primary reading voice (one calm `design.reading text`, read or not), the user's own message in muted teal (`design.marked`) with a `2 px` teal left gutter bar; a quiet name line above a message from anyone else (or a quiet agent short code when more than one agent has a live message in the same thread); a quiet tag at the end of the text, such as `edited` or `taken back`; what the message quotes. Never inserts date separator lines or collapses older history.
 does:
 - ping: every agent `Message` pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. An agent names the kind of everything it sends, `kind="message"` or `kind="flash"`, with no default, so it decides each time whether the user is needed
 - look into the work `enter` on an agent message or `Flash` (when cursor is not on a private reply or link): open the `agents.Workset` transcript at the step that produced its current words; a failed stop opens its error
@@ -88,6 +88,7 @@ rejected:
 - a required `## proof` section on every result message · 2026-11-26 · rigid templates fight different kinds of work; let agents back up results flexibly in prose, links, or captures, and use `agents.Change` (`open diff`) or the workset transcript when deeper inspection is needed
 - replacing conversational request-response threads with a rigid mutable casefile state machine · 2026-11-26 · back-and-forth brainstorming and follow-ups need real conversation
 - kinds of message, `ask`, `result`, and `fyi` · 2026-11-20 · one yes or no, whether the message pings, does the job; a result waits like an ask
+- a relative age on each message and flash in a thread · 2026-11-28 · the user found it useless there; `window.Places` and the card say how long a thread waited
 - a message that is kept but does not ping · 2026-11-21 · anything worth the record is worth a card, and agents used it to be polite; progress is a `Flash`
 - a `## recap` section on a cold message, so it reads without the history · 2026-11-21 · with the newest message on top, the context is one glance below; the recap fold hid whole messages, and agents wrote it badly
 - a reply with an addressee: the draft answers one message, says so with an `answers …` line, `r` retargets, and the host delivers the words to that writer only · 2026-11-21 · a chat message has no target; every agent in the thread reads it and the user names one in words when it matters. The deal still settles the card the user came from
@@ -99,7 +100,7 @@ Agents can search messages. A message written while the host is away waits on th
 ## concept Flash
 purpose: let an agent say what it is doing or about to do, for the user who happens to be there, without a card and without a trace.
 principle: an agent writes `I plan to drop the cache layer, say no in 20 min` and starts; the user who is in the thread replies `no`, and the agent changes course; the user who is away never sees it, and the thread does not grow.
-sees: the words in `design.quiet` under the draft, newest first among the thread's messages, with the age at the end of the first line, `12m`; one open flash per agent, with its earlier fresh flashes folded under it as `+2 earlier`; on the thread's row in `window.Places`, the newest flash's first line as the latest words.
+sees: the words in `design.quiet` under the draft, newest first among the thread's messages; one open flash per agent, with its earlier fresh flashes folded under it as `+2 earlier`; on the thread's row in `window.Places`, the newest flash's first line as the latest words.
 does:
 - post, by an agent with `kind="flash"`: show it in the thread for twenty minutes from its first post, longer while it is the thread's newest item from either side; it goes when the clock has run and something newer exists, a message or a flash from anyone; then it is gone from every device, not kept as history
 - look into the work `enter` on a flash: open the `agents.Workset` transcript at the step that posted it
@@ -133,15 +134,15 @@ rejected:
 A thread (and the `desk.Desk` new-thread canvas) has one draft on each device, not shared with other devices.
 
 ## screen Thread
-decided: 2026-11-28 · subject and quiet tags/actors in Thread's top-left title row (no model name, no waits·age; muted / snoozed until … / approve push / working / stopped shown when active), Draft on row 1 with no placeholder, 128ch centered sheet with everything soft-wrapped at 80ch and ages in one column past it, Mono + Balanced, 0px square corners
+decided: 2026-11-28 · subject and quiet tags/actors in Thread's top-left title row (no model name, no waits·age; muted / snoozed until … / approve push / working / stopped shown when active), Draft on row 1 with no placeholder, 128ch centered sheet with everything soft-wrapped at 80ch, Mono + Balanced, 0px square corners
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject, any quiet tags/actors (`:rho`, `:roboman`), and any active page marker (`muted`, `snoozed until …`, `approve push`, `working`, `stopped by you`, `stuck`) in Thread's top-left title row beside the notch (omitting redundant `waits · age` and model name, which lives in `agents.Transcript`)
-- inside a `128 ch` centered sheet (every line, code and tables too, soft-wraps at `80 ch`; the ages stand just past that edge):
+- inside a `128 ch` centered sheet (every line, code and tables too, soft-wraps at `80 ch`):
 - the `Draft` first on row 1 (no `reply` placeholder, `2 px` teal left gutter bar, space alone below), or stuck to the top edge while the user reads history below
 - any pending staged push/fetch approval right below the draft (naming repo, refs, force-push dropped count, commits, bounded diff, and `space a approves · space x denies (with draft reply) · space s snoozes`)
-- the `Message` newest first, readable and copyable with the same motions and search as the `Draft`, but not editable; agent messages are the unmarked primary voice (one calm colour, read or not), user messages are muted teal with a `2 px` left gutter bar, and relative ages sit flush-right in `quiet`; no date separators and no collapsed history
-- the fresh `Flash` of each agent in `design.quiet` with its age flush-right, in its place among the messages, with that agent's earlier fresh flashes folded under it
+- the `Message` newest first, readable and copyable with the same motions and search as the `Draft`, but not editable; agent messages are the unmarked primary voice (one calm colour, read or not), user messages are muted teal with a `2 px` left gutter bar; no ages and no date separators and no collapsed history
+- the fresh `Flash` of each agent in `design.quiet`, in its place among the messages, with that agent's earlier fresh flashes folded under it
 - a `notes.Private reply` below its message, editable there; tangents appear as a quiet `↳ N tangents` line below their parent message and open as their own `Thread`
 states:
 - empty: the empty draft, then the opening message; a thread begins with a message
