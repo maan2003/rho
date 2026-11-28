@@ -67,9 +67,9 @@ pub struct HostChat {
     /// The first thread each agent joined: its thread, the one it started
     /// from, where a stop it did not choose draws the user.
     first_joined: BTreeMap<AgentId, MessageId>,
-    /// The thread each agent joined last: a standing agent joins each
-    /// idea's thread as it takes it up.
-    last_joined: BTreeMap<AgentId, MessageId>,
+    /// The threads each agent joined, the latest join last: a standing
+    /// agent joins each idea's thread as it takes it up.
+    joins: BTreeMap<AgentId, Vec<MessageId>>,
 }
 
 impl HostChat {
@@ -144,7 +144,9 @@ impl HostChat {
             ChatEvent::Joined { thread, agent } => {
                 self.members.insert((*thread, *agent), true);
                 self.first_joined.entry(*agent).or_insert(*thread);
-                self.last_joined.insert(*agent, *thread);
+                let joins = self.joins.entry(*agent).or_default();
+                joins.retain(|joined| joined != thread);
+                joins.push(*thread);
                 Told::Thread(*thread)
             }
             ChatEvent::Left { thread, agent } => {
@@ -487,13 +489,19 @@ impl HostChat {
             .map(|joined| self.thread_of(*joined))
     }
 
-    /// The thread an agent works in now: the one it joined last, read as
-    /// the thread its words show in. An agent another agent made joined
-    /// its brief, which hangs in the thread of the work it helps.
+    /// The thread the user meets an agent in now: of the threads it
+    /// joined, the one it joined last that the user is dealt, read as the
+    /// thread its words show in. A thread only agents see, such as a root
+    /// a tool opened to wake it (`rho debug send-message`) or another
+    /// agent's brief, never hides the user's thread behind it. An agent
+    /// that joined only those has none.
     pub fn working_thread(&self, agent: AgentId) -> Option<MessageId> {
-        self.last_joined
-            .get(&agent)
+        self.joins
+            .get(&agent)?
+            .iter()
+            .rev()
             .map(|joined| self.thread_of(*joined))
+            .find(|thread| !self.agent_only(*thread))
     }
 
     /// The newest words in a thread or under it, the thread's own mail
