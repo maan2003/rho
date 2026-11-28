@@ -121,7 +121,7 @@ use diagnostics::{ActiveDiagnostic, GlobalDiagnosticRenderer, InlineDiagnostic};
 pub use diagnostics::{DiagnosticRenderer, set_diagnostic_renderer};
 pub use display_map::{
     ChunkRenderer, ChunkRendererContext, DisplayElisionId, DisplayElisionProperties, DisplayPoint,
-    FoldPlaceholder, HighlightKey, NavigationOverlayKey, SemanticTokenHighlight,
+    FoldPlaceholder, HangingIndent, HighlightKey, NavigationOverlayKey, SemanticTokenHighlight,
 };
 #[cfg(feature = "native")]
 pub use edit_prediction::make_suggestion_styles;
@@ -10471,15 +10471,11 @@ impl Editor {
         cx.notify();
     }
 
-    /// Sets continuation indents, in space columns, for inclusive anchored source-row ranges.
-    /// Ranges must be ascending and nonoverlapping; an empty vector clears all overrides.
-    pub fn set_hanging_indents(
-        &mut self,
-        ranges: Vec<(Range<Anchor>, u32)>,
-        cx: &mut Context<Self>,
-    ) {
+    /// Sets the rule that indents the rows a line wraps onto, from the
+    /// line's text, such as under the words after a list marker.
+    pub fn set_hanging_indent(&mut self, rule: Option<HangingIndent>, cx: &mut Context<Self>) {
         self.display_map
-            .update(cx, |map, cx| map.set_hanging_indents(ranges, cx));
+            .update(cx, |map, cx| map.set_hanging_indent(rule, cx));
         cx.notify();
     }
 

@@ -110,7 +110,7 @@ pub use wrap_map::WrapSyncTrace;
 pub use wrap_map::set_wrap_batch_clock_enabled;
 #[cfg(feature = "wrap-test-support")]
 pub use wrap_map::set_wrap_rows_check_enabled;
-pub use wrap_map::{WrapPoint, WrapRow, WrapSnapshot};
+pub use wrap_map::{HangingIndent, WrapPoint, WrapRow, WrapSnapshot};
 
 use collections::{HashMap, HashSet, IndexSet};
 use gpui::{
@@ -1617,19 +1617,10 @@ impl DisplayMap {
             .update(cx, |map, cx| map.set_wrap_width(width, cx))
     }
 
-    /// Sets hanging indents, in space columns, for inclusive anchored source-row ranges.
-    /// Ranges must be ascending and nonoverlapping; an empty vector clears all overrides.
-    pub fn set_hanging_indents(
-        &mut self,
-        ranges: Vec<(Range<Anchor>, u32)>,
-        cx: &mut Context<Self>,
-    ) {
-        // The wrap map rewraps at once and resolves the anchors against the
-        // buffer it last saw; bring it up to the buffer the anchors come
-        // from first, every map below it with it.
-        self.snapshot(cx);
+    /// Sets the rule that indents the rows a line wraps onto.
+    pub fn set_hanging_indent(&self, rule: Option<HangingIndent>, cx: &mut Context<Self>) {
         self.wrap_map
-            .update(cx, |map, cx| map.set_hanging_indents(ranges, cx));
+            .update(cx, |map, cx| map.set_hanging_indent(rule, cx));
     }
 
     pub fn set_soft_wrap_indent(&self, indent: SoftWrapIndent, cx: &mut Context<Self>) -> bool {

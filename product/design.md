@@ -52,6 +52,7 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 
 ## token time
 - echo life · `4 s` · long enough to see the result of the last action in the Top-Right Global Status Bar (temporarily hiding quiet notices; full history in `show messages`).
+- slow send · `2 s` · how long the user's sent words read as sent before they turn `quiet`; a host that takes them in time never shows a sending state.
 - age beat · `1 min` · refresh elapsed ages on thread summaries without a ticking clock on every row.
 - card age step · `now` during the first minute, nearest minute thereafter under an hour, tenth of an hour under a day, tenth of a day after that · change the words when the displayed age changes.
 - while needed · event-bound, no fixed duration · the signal or open choice stays while it is true or still takes the next action.
@@ -112,7 +113,7 @@ purpose: let the user read an exchange and know who said what immediately, with 
 looks: laid out inside the `sheet measure` (`128 ch` centered). Every line, prose, quotes, private replies, code blocks, diffs, and markdown tables, soft-wraps at `prose measure` (`80 ch`) on the same straight left edge (`0 px` corners); a wrapped list item or quote hangs under the words after its marker. The project/agent's message is the primary unmarked reading voice, in `reading text` whether read or not, with no bar; the user's own message uses muted teal (`marked`) with a `2 px` teal bar in the left gutter beside every line and `10 px` of air before the words. A message carries no age; the card and `window.Places` say how long a thread waited. No date separator rows and no collapsed history folds. A `quiet` name line appears above a message from a third voice (or agent short code when multiple agents speak live); `· edited` or `· taken back` sits in `quiet` at the end of the prose.
 states:
 - flash: a `chat.Flash` in `quiet`, with no age; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
-- sending: the user's words in `quiet` until the host has the message.
+- sending: the user's words read as sent, in place and laid out as they will stay, so nothing moves when the host takes them. After `slow send` they turn `quiet` until the host has them. No `sending…` tag (2026-11-28: the tag came and went on every send and looked like a flicker).
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `chat.Thread`.
 form: [project and user message on the laptop](design/laptop-card.png) and [the open thread](design/laptop-reading.png).
