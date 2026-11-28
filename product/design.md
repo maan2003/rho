@@ -24,8 +24,8 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - behind the prompt · black at `35%` opacity · the laptop screen and the status right of the notch are still there while the prompt panel takes the keys.
 
 ## token type
-- editor text · Rho Font (monospace), `15 px`, weight `400` · one crisp grid from the work to the prompt and top ears.
-- reading rhythm · `1.54` times the editor text size (`Balanced`) · comfortable breathing room for reading long threads.
+- editor text · Rho Font, `15.5 px` (`31` device px at the laptop's 2x; UI text `14.5 px`), weight `400` · one crisp grid from the work to the prompt and top ears. A device may name another family and weight (`RHO_GUI_FONT_FAMILY`, `RHO_GUI_FONT_WEIGHT`), not another size (2026-11-28: sizes are rho's defaults, not a per-device scale).
+- reading rhythm · `1.55` times the editor text size, `24 px` (`48` device px) (`Balanced`) · comfortable breathing room for reading long threads.
 - emphasis · weight `650–700` · make an unread name, `INS` mode, or menu title findable without making it larger. Page heading titles stay at weight `400`: `title` color alone sets them apart.
 - private aside · italic · the user's own remark rather than a turn in the exchange.
 - thumb icon · `18 px` · recognize the action before reading its word.

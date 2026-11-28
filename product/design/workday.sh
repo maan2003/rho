@@ -188,7 +188,7 @@ workday_gui() {
     # shellcheck disable=SC2016 # sh expands these
     workday_way "$name" start --width 1300 --height 850 --scale 1 -- \
         dbus-run-session -- env \
-        -u RHO_GUI_FONTS -u RHO_GUI_FONT_FAMILY -u RHO_GUI_FONT_SCALE \
+        -u RHO_GUI_FONTS -u RHO_GUI_FONT_FAMILY \
         -u RHO_GUI_FONT_WEIGHT -u RHO_GUI_FONT_BOLD_WEIGHT \
         RUST_LOG="${RUST_LOG:-info}" \
         XDG_STATE_HOME="$rig/device/state" XDG_CONFIG_HOME="$rig/device/config" \
