@@ -108,10 +108,12 @@ impl Saved {
 mod legacy {
     use super::*;
 
-    const PLACE: TableDefinition<(), Sen<History>> = TableDefinition::new("gui_frame_place_v1");
+    const PLACE: TableDefinition<(), Sen<Saved>> = TableDefinition::new("gui_frame_place_v1");
 
+    // Sen persists the short Rust type name. Keep the previous release's
+    // Saved name even though this now lives in the legacy module.
     #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
-    pub(super) struct History {
+    pub(super) struct Saved {
         pub screens: Vec<String>,
         pub at: u32,
         pub visits: Option<Vec<Visit>>,
@@ -123,7 +125,7 @@ mod legacy {
         pub wall_ms: Option<u64>,
     }
 
-    pub(super) fn load(db: &RhoDb) -> Option<Saved> {
+    pub(super) fn load(db: &RhoDb) -> Option<super::Saved> {
         let read = db.read();
         if !read.has_table(PLACE.name()) {
             return None;
@@ -134,7 +136,7 @@ mod legacy {
 
     /// The screen in view first, then the rest by their last visit; the
     /// oldest releases called the desk `home`.
-    pub(super) fn convert(history: &History) -> Saved {
+    pub(super) fn convert(history: &Saved) -> super::Saved {
         let mut places: Vec<(usize, u64, SavedPlace)> = history
             .screens
             .iter()
@@ -164,7 +166,7 @@ mod legacy {
                 index.abs_diff(at),
             )
         });
-        Saved {
+        super::Saved {
             places: places.into_iter().map(|(.., place)| place).collect(),
         }
     }
@@ -336,7 +338,7 @@ mod tests {
     #[test]
     fn the_last_builds_history_opens_in_visit_order() {
         let visit = |order, wall_ms| legacy::Visit { order, wall_ms };
-        let history = legacy::History {
+        let history = legacy::Saved {
             screens: ["frame:home", "thread:old", "thread:left", "thread:later"]
                 .map(str::to_owned)
                 .to_vec(),
@@ -362,7 +364,7 @@ mod tests {
         assert_eq!(recent.visited_ms(&address("thread:old")), Some(40));
 
         // An older record without visits: nearer the screen in view first.
-        let bare = legacy::History {
+        let bare = legacy::Saved {
             visits: None,
             ..history
         };
@@ -379,13 +381,77 @@ mod tests {
         futures::executor::block_on(async {
             let mut write = db.write().await;
             write
-                .open_table(TableDefinition::<(), Sen<legacy::History>>::new(
+                .open_table(TableDefinition::<(), Sen<legacy::Saved>>::new(
                     "gui_frame_place_v1",
                 ))
                 .insert((), SenValue::borrowed(&bare));
             write.commit();
         });
         assert_eq!(Saved::load(&db), Some(legacy::convert(&bare)));
+    }
+
+    /// Write the previous release's schema independently of the migration
+    /// reader: redb persists the Sen type name as well as the encoded bytes.
+    #[test]
+    fn the_previous_releases_database_opens_and_is_rewritten() {
+        mod previous_release {
+            use senax_encoder::{Decode, Encode};
+
+            #[derive(Debug, Encode, Decode)]
+            pub struct Saved {
+                pub screens: Vec<String>,
+                pub at: u32,
+                pub visits: Option<Vec<SavedVisit>>,
+            }
+
+            #[derive(Debug, Encode, Decode)]
+            pub struct SavedVisit {
+                pub order: u64,
+                pub wall_ms: Option<u64>,
+            }
+        }
+
+        for visits in [
+            None,
+            Some(vec![previous_release::SavedVisit {
+                order: 1,
+                wall_ms: Some(123),
+            }]),
+        ] {
+            let visited_ms = visits.as_ref().map(|_| 123);
+            let db = RhoDb::in_memory();
+            futures::executor::block_on(async {
+                let mut write = db.write().await;
+                write
+                    .open_table(TableDefinition::<(), Sen<previous_release::Saved>>::new(
+                        "gui_frame_place_v1",
+                    ))
+                    .insert(
+                        (),
+                        SenValue::borrowed(&previous_release::Saved {
+                            screens: vec!["thread:left".into(), "frame:home".into()],
+                            at: 0,
+                            visits,
+                        }),
+                    );
+                write.commit();
+            });
+            let saved = Saved::load(&db).expect("the old release's history loads");
+            let recent = saved.recent(&address("frame:desk"));
+            assert_eq!(
+                order(&recent),
+                [address("thread:left"), address("frame:desk")]
+            );
+            assert_eq!(recent.visited_ms(&address("thread:left")), visited_ms);
+            let writer = Writer::spawn(db.clone());
+            writer.write(Write::Place(saved.clone()));
+            drop(writer);
+            assert_eq!(
+                Saved::load(&db),
+                Some(saved),
+                "the new record loads on restart"
+            );
+        }
     }
 
     /// A record without the desk, or with an address this build cannot
