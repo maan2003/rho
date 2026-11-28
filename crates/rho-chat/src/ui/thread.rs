@@ -14,12 +14,12 @@ use editor::{
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, KeyBinding, MouseButton,
-    MouseDownEvent, Subscription, TextStyleRefinement, Window, actions, div,
+    MouseDownEvent, Subscription, Task, TextStyleRefinement, Window, actions, div,
 };
 use language::{Buffer, BufferEvent, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
-    Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId, Revision, Voice,
+    Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId, Revision, UnixMs, Voice,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Addressed as _, Card, Marks};
@@ -298,6 +298,8 @@ pub struct ThreadView {
     /// Resolve against the new transcript before inferring motion direction.
     last_point: Anchor,
     expanded: Expanded,
+    /// Looks again when words on their way turn `quiet`.
+    _slow_send: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -424,7 +426,10 @@ impl ThreadView {
         let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
-            rho_window::markdown::configure_buffer(&mut buffer, cx);
+            // The whole thread is one document: its parse holds the frame
+            // that made the text, so new words never draw the markup they
+            // conceal and then wrap again without it.
+            rho_window::markdown::configure_document(&mut buffer, cx);
             buffer
         });
         let draft = cx.new(|cx| Buffer::local(system.draft(thread.host, Some(thread.message)), cx));
@@ -446,6 +451,9 @@ impl ThreadView {
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
             rho_notes::sheet::take_gutter(&mut editor, cx);
+            // A list item or a quote that wraps keeps its words on one left
+            // edge, in the draft and the history alike.
+            editor.set_hanging_indent(Some(rho_notes::sheet::hanging_indent), cx);
             draft::stick(&mut editor, "↑ new".into(), cx);
             let doc = editor.buffer().read(cx).snapshot(cx);
             style_draft_in(&mut editor, draft::range(&doc), cx);
@@ -552,13 +560,13 @@ impl ThreadView {
             seen_asks: left.map(|left| left.seen_asks.clone()).unwrap_or_default(),
             last_point: Anchor::Min,
             expanded: Expanded::default(),
+            _slow_send: None,
             _subscriptions: subscriptions,
         };
         view.transcript.set_gutter(token::marked_bar_in);
         view.transcript.attach(&view.editor, cx);
         let items = items(system, thread, &view.expanded, None, cx);
         view.transcript.reconcile(items, cx);
-        view.hang_lines(cx);
         let end = view.editor.update(cx, |editor, cx| {
             let display = editor.display_snapshot(cx);
             let end = draft::range(display.buffer_snapshot()).end;
@@ -731,28 +739,29 @@ impl ThreadView {
             cx,
         );
         self.transcript.reconcile(items, cx);
-        self.hang_lines(cx);
+        self.schedule_slow_send(cx);
         cx.notify();
     }
 
-    /// A list item or a quote that wraps keeps its words on one left
-    /// edge: each line it wraps to starts under the words after its
-    /// marker, in the draft and the history alike.
-    fn hang_lines(&mut self, cx: &mut Context<Self>) {
-        let doc = self.document(cx);
-        let mut ranges = Vec::new();
-        for row in 0..=doc.max_point().row {
-            let end = Point::new(row, doc.line_len(multi_buffer::MultiBufferRow(row)));
-            let line: String = doc.text_for_range(Point::new(row, 0)..end).collect();
-            if let Some(indent) = sheet::hanging_indent(&line) {
-                ranges.push((
-                    doc.anchor_before(Point::new(row, 0))..doc.anchor_after(end),
-                    indent,
-                ));
-            }
-        }
-        self.editor
-            .update(cx, |editor, cx| editor.set_hanging_indents(ranges, cx));
+    /// Words on their way turn `quiet` once they are `SLOW_SEND_MS` old:
+    /// look again then.
+    fn schedule_slow_send(&mut self, cx: &mut Context<Self>) {
+        let now = UnixMs::now().0;
+        let system = self.system.read(cx);
+        let wait = system
+            .local_under(self.thread.host, Some(self.thread.message))
+            .into_iter()
+            .filter(|outgoing| outgoing.state == crate::outbox::OutgoingState::Queued)
+            .map(|outgoing| (outgoing.at.0 + SLOW_SEND_MS).saturating_sub(now))
+            .filter(|wait| *wait > 0)
+            .min();
+        self._slow_send = wait.map(|wait| {
+            let wait = std::time::Duration::from_millis(wait);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |view, cx| view.refresh(cx));
+            })
+        });
     }
 
     fn subscribe_draft(draft: &Entity<Buffer>, cx: &mut Context<Self>) -> Subscription {
@@ -760,7 +769,6 @@ impl ThreadView {
             if matches!(event, BufferEvent::Edited { .. }) {
                 let text = draft.read(cx).text();
                 view.style_draft(cx);
-                view.hang_lines(cx);
                 let thread = view.thread;
                 view.system.update(cx, |system, _| {
                     system.set_draft(thread.host, Some(thread.message), text);
@@ -777,7 +785,6 @@ impl ThreadView {
         self.draft = draft;
         self.draft_point = None;
         self.style_draft(cx);
-        self.hang_lines(cx);
     }
 
     fn style_draft(&self, cx: &mut App) {
@@ -1083,7 +1090,7 @@ fn history_items(
             &expanded.quotes,
         )
     };
-    items.extend(pending_items(system, host, thread.message));
+    items.extend(pending_items(system, host, thread.message, UnixMs::now()));
     let flashes = flash_groups(chat.reading_order(thread.message));
     let mut history: Vec<_> = chat.reading_order(thread.message).collect();
     history.reverse();
@@ -1310,12 +1317,18 @@ fn private_item(
         .with_blocks(block.into_iter().collect())
 }
 
+/// How long words on their way read as sent before they turn `quiet`
+/// (`design.slow send`): a host that takes them in time never shows the
+/// state.
+const SLOW_SEND_MS: u64 = 2_000;
+
 /// The user's messages into `parent` that no host has logged yet, newest
 /// first.
 fn pending_items(
     system: &ChatSystem,
     host: EndpointId,
     parent: MessageId,
+    now: UnixMs,
 ) -> Vec<Item<Key, Class, Meta>> {
     let mut items = Vec::new();
     let mut outgoing = system.local_under(host, Some(parent));
@@ -1323,24 +1336,33 @@ fn pending_items(
     for outgoing in outgoing {
         let id = outgoing.at.0;
         let mut text = body(&outgoing.content);
-        let first = text.find('\n').unwrap_or(text.len());
-        let suffix = match &outgoing.state {
-            crate::outbox::OutgoingState::Queued => " · sending…".to_owned(),
+        let len = text.len();
+        // Words on their way read as sent, laid out as they will be once
+        // the host has them, so their landing changes nothing. Only words
+        // the host has not taken in `SLOW_SEND_MS` turn `quiet`. A refusal
+        // is an answer, told in words.
+        let styles = match &outgoing.state {
+            crate::outbox::OutgoingState::Queued => {
+                let slow = now.0.saturating_sub(outgoing.at.0) >= SLOW_SEND_MS;
+                vec![(if slow { Class::Pending } else { Class::User }, 0..len)]
+            }
             crate::outbox::OutgoingState::Refused { reason } => {
-                format!(" · not sent: {}", rho_agent_types::one_line(reason))
+                let first = text.find('\n').unwrap_or(len);
+                let tag = format!(" · not sent: {}", rho_agent_types::one_line(reason));
+                text.insert_str(first, &tag);
+                let end = first + tag.len();
+                vec![
+                    (Class::User, 0..first),
+                    (Class::Pending, first..end),
+                    (Class::User, end..text.len()),
+                ]
             }
         };
-        text.insert_str(first, &suffix);
-        let tag = first..first + suffix.len();
         let lines = text.lines().count().max(1);
         let len = text.len();
         items.push(
             Item::new(Key::Pending(id), text)
-                .with_styles(vec![
-                    (Class::User, 0..tag.start),
-                    (Class::Pending, tag.clone()),
-                    (Class::User, tag.end..len),
-                ])
+                .with_styles(styles)
                 .with_lines(vec![Meta::None; lines])
                 .with_gutter(0..len),
         );
@@ -2817,9 +2839,36 @@ mod tests {
                 .unwrap()
         };
         assert!(
-            doc(cx).starts_with("\n\nLine 1 of the answer. · sending…\n"),
+            doc(cx).starts_with("\n\nLine 1 of the answer.\n"),
             "{}",
             doc(cx)
+        );
+        let while_sending = doc(cx);
+        // Words on their way read as sent; only a slow host turns them
+        // quiet, and neither changes the words.
+        let pending = |cx: &mut gpui::TestAppContext, late: u64| {
+            cx.update(|cx| {
+                let system = mail.read(cx);
+                let at = system.local_under(thread.host, Some(thread.message))[0].at;
+                pending_items(system, thread.host, thread.message, UnixMs(at.0 + late))
+            })
+        };
+        let classes = |items: Vec<Item<Key, Class, Meta>>| {
+            let item = items.into_iter().next().unwrap();
+            assert_eq!(item.text.trim_end(), draft);
+            item.styles
+                .into_iter()
+                .map(|(class, range)| (class, range.len()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(classes(pending(cx, 0)), [(Class::User, draft.len())]);
+        assert_eq!(
+            classes(pending(cx, SLOW_SEND_MS - 1)),
+            [(Class::User, draft.len())]
+        );
+        assert_eq!(
+            classes(pending(cx, SLOW_SEND_MS)),
+            [(Class::Pending, draft.len())]
         );
 
         cx.update(|cx| {
@@ -2848,7 +2897,94 @@ mod tests {
             })
         });
         assert_eq!(drawn(cx, window), sending, "when the sent mail lands");
-        assert!(doc(cx).starts_with("\n\nLine 1 of the answer.\n"));
+        // The words do not change when they land, so no line wraps again.
+        assert_eq!(doc(cx), while_sending);
+    }
+
+    /// A list item hangs under its words wherever it is, and neither a
+    /// key in the draft nor a send rewraps the whole thread: a long
+    /// thread's full rewrap runs in the background, and until it lands
+    /// the new lines show unwrapped.
+    #[gpui::test]
+    fn writing_and_sending_rewrap_only_the_lines_they_touch(cx: &mut gpui::TestAppContext) {
+        let item = format!("- {}", "words that run on ".repeat(8).trim_end());
+        let (window, _mail, _db, _thread) = long_thread(cx, 40, &item);
+        drawn(cx, window);
+        let editor = window
+            .update(cx, |frame, _, cx| {
+                frame.current_surface().editor(cx).unwrap()
+            })
+            .unwrap();
+        let rows = |cx: &mut gpui::TestAppContext| {
+            editor.update(cx, |editor, cx| {
+                editor.display_snapshot(cx).max_point().row().0 + 1
+            })
+        };
+        // How far down the thread a wrap pass reached since the last ask.
+        // The draft and the newest message are at the top, so a pass that
+        // reaches the end laid out the whole thread again.
+        let seen = std::cell::Cell::new(0);
+        let rewrapped = |cx: &mut gpui::TestAppContext| {
+            editor.update(cx, |editor, cx| {
+                let records = editor.display_map.read(cx).wrap_sync_records(cx);
+                let reach = records[seen.get()..]
+                    .iter()
+                    .map(|record| record.new_end)
+                    .max()
+                    .unwrap_or(0);
+                seen.set(records.len());
+                reach
+            })
+        };
+        let draft_rows = |cx: &mut gpui::TestAppContext| {
+            editor.update(cx, |editor, cx| {
+                let display = editor.display_snapshot(cx);
+                display
+                    .text()
+                    .lines()
+                    .take_while(|line| !line.contains("sending"))
+                    .skip_while(|line| !line.starts_with("- "))
+                    .take(3)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let total = rows(cx);
+        assert!(
+            total > 100,
+            "a thread long enough to wrap in the background: {total}"
+        );
+        let hung = draft_rows(cx);
+        assert!(hung[0].starts_with("- words"), "{hung:?}");
+        assert!(
+            hung[1].starts_with("  words") && hung[1].trim_start().len() + 2 == hung[1].len(),
+            "the item's second row hangs under its words: {hung:?}"
+        );
+        rewrapped(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| editor.insert(" more", window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let typed = rewrapped(cx);
+        assert!(typed < 20, "a key rewrapped down to row {typed} of {total}");
+
+        cx.dispatch_action(window.into(), SendMessage);
+        drawn(cx, window);
+        let sent = rewrapped(cx);
+        assert!(sent < 20, "a send rewrapped down to row {sent} of {total}");
+        let doc = editor.update(cx, |editor, cx| editor.display_snapshot(cx).text());
+        let at = doc
+            .lines()
+            .position(|line| line.starts_with("- words"))
+            .unwrap();
+        let next = doc.lines().nth(at + 1).unwrap();
+        assert!(
+            next.starts_with("  words"),
+            "the sent item still hangs: {doc:?}"
+        );
     }
 
     /// Mail that lands at the top while the reader is in the history
@@ -4312,17 +4448,14 @@ mod tests {
                 assert!(
                     view.document(cx)
                         .text()
-                        .starts_with(&format!("\n\n{reply} · sending…\n"))
+                        .starts_with(&format!("\n\n{reply}\n"))
                 );
             })
             .unwrap();
 
         assert_eq!(
             mail_gutters(cx),
-            [
-                (2, 2, format!("{reply} · sending…")),
-                (6, 8, preceding.clone()),
-            ],
+            [(2, 2, reply.to_owned()), (6, 8, preceding.clone()),],
         );
 
         // The receipt can clear the optimistic row before the durable mail
