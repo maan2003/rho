@@ -1057,38 +1057,17 @@ fn items(
     private_edit: Option<&PrivateEdit>,
     cx: &App,
 ) -> (Vec<Item<Key, Class, Meta>>, Vec<Age>) {
-    let mut items = vec![seam()];
+    let mut items = vec![separator()];
     items.extend(ask_items(system, thread, cx));
     let (history, ages) = history_items(system, thread, expanded, private_edit, cx);
     items.extend(history);
     (items, ages)
 }
 
-/// The blank line between the draft and the newest item, with a soft
-/// hairline across the sheet at its top: the draft's lower edge.
-/// The same block on every refresh, so an unchanged separator is never
-/// replaced: a replaced item moves the text the scroll is anchored to.
-fn seam() -> Item<Key, Class, Meta> {
-    static HAIRLINE: std::sync::LazyLock<editor::display_map::RenderBlock> =
-        std::sync::LazyLock::new(|| {
-            Arc::new(|cx| {
-                div()
-                    .block_mouse_except_scroll()
-                    .w_full()
-                    .h(cx.line_height)
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .child(div().w_full().h(gpui::px(1.)).bg(token::soft_seam()))
-                    .into_any_element()
-            })
-        });
-    gap(Key::Separator).with_blocks(vec![BlockSpec {
-        line: BlockLine::Above(0),
-        height: 1,
-        render: HAIRLINE.clone(),
-        priority: 0,
-    }])
+/// The blank line between the draft and the newest item. Space alone sets
+/// the draft apart: no line is drawn.
+fn separator() -> Item<Key, Class, Meta> {
+    gap(Key::Separator)
 }
 
 /// What the thread calls an agent on a line of its own: its short code,
@@ -2562,7 +2541,7 @@ impl Render for ThreadView {
                     let _ = this.update(cx, |view, cx| view.set_columns(columns, measure, cx));
                 });
             });
-        let page = sheet::page(&heading, &text, editor, window, cx);
+        let page = sheet::page_with_canopy(&heading, &text, editor, &self.editor, window, cx);
         div()
             .id("thread")
             .relative()

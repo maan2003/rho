@@ -11328,8 +11328,8 @@ impl Element for EditorElement {
 
                     let history_mask = layout.stuck_excerpt.as_ref().map(|panel| {
                         let (top, bottom) = match panel.edge {
-                            StuckEdge::Top => (panel.chrome.bottom(), bounds.bottom()),
-                            StuckEdge::Bottom => (bounds.top(), panel.chrome.top()),
+                            StuckEdge::Top => (panel.text.chrome.bottom(), bounds.bottom()),
+                            StuckEdge::Bottom => (bounds.top(), panel.text.chrome.top()),
                         };
                         ContentMask {
                             bounds: Bounds::new(

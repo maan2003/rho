@@ -1,16 +1,19 @@
 use super::*;
 
-const SEAM_WIDTH: Pixels = px(1.);
-
-// The band is part of the projection, not a display row.
+// The band is part of the projection, not a display row. It is one whole
+// row, so the projection's lower edge falls on a row boundary of the text
+// below it and never cuts through the glyphs of a line.
 fn top_band_height(line_height: Pixels) -> Pixels {
-    line_height / 2. + px(2.) + SEAM_WIDTH
+    line_height
 }
 
 pub(crate) struct StuckExcerptText {
     pub(crate) rows: Range<DisplayRow>,
     pub(crate) lines: Vec<LineWithInvisibles>,
     pub(crate) bounds: Bounds<Pixels>,
+    /// The rows and the band beside them, which the text below never
+    /// paints over.
+    pub(crate) chrome: Bounds<Pixels>,
     pub(crate) top_y: f64,
     pub(crate) max_offset: f64,
 }
@@ -18,7 +21,6 @@ pub(crate) struct StuckExcerptText {
 pub(super) struct StuckExcerptLayout {
     pub(super) text: Rc<StuckExcerptText>,
     pub(super) edge: StuckEdge,
-    pub(super) chrome: Bounds<Pixels>,
     background: Hsla,
     gutter: Vec<(Range<DisplayPoint>, Hsla)>,
     origin: gpui::Point<Pixels>,
@@ -62,6 +64,7 @@ impl EditorElement {
             let state = editor.stuck_excerpt.as_ref()?;
             let edge = state.edge;
             let background = (state.background)(cx);
+            let label_color = (state.label_color)(cx);
             let mut chrome_height = match edge {
                 StuckEdge::Top => top_band_height(line_height),
                 StuckEdge::Bottom => px(0.),
@@ -82,7 +85,7 @@ impl EditorElement {
                     &[TextRun {
                         len: text.len(),
                         font: self.style.text.font(),
-                        color: cx.theme().colors().text_muted.into(),
+                        color: label_color,
                         ..Default::default()
                     }],
                     None,
@@ -249,11 +252,11 @@ impl EditorElement {
                 rows,
                 lines,
                 bounds: hitbox.bounds,
+                chrome,
                 top_y: panel.top_y,
                 max_offset: panel.max_offset,
             }),
             edge,
-            chrome,
             background,
             gutter,
             origin,
@@ -277,8 +280,8 @@ impl EditorElement {
         let line_height = layout.position_map.line_height;
         let snapshot = &layout.position_map.snapshot;
         let bounds = Bounds::from_corners(
-            point(layout.hitbox.left(), panel.chrome.top()),
-            point(layout.hitbox.right(), panel.chrome.bottom()),
+            point(layout.hitbox.left(), panel.text.chrome.top()),
+            point(layout.hitbox.right(), panel.text.chrome.bottom()),
         );
         let whitespaces = self
             .editor
@@ -294,35 +297,21 @@ impl EditorElement {
                     * (snapshot.row_y(layout.position_map.scroll_position.y) - panel.text.top_y)
                         as f32,
             );
-        if panel.edge == StuckEdge::Top {
-            let below = Bounds::from_corners(
-                point(bounds.left(), bounds.bottom()),
-                layout.hitbox.bounds.bottom_right(),
-            );
-            window.with_content_mask(Some(ContentMask { bounds: below }), |window| {
-                let shadow = gpui::BoxShadow::new(px(0.), px(4.), gpui::black().opacity(0.35))
-                    .blur_radius(px(12.));
-                window.paint_drop_shadows(bounds, Corners::default(), &[shadow]);
-            });
-        }
+        // A top projection is set apart from the text below by its tone
+        // alone: no seam and no shadow.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             window.paint_layer(|window| {
                 window.paint_quad(fill(bounds, panel.background));
                 match panel.edge {
+                    // The bar runs beside the rows, as it does inline;
+                    // the band below them is tone only.
                     StuckEdge::Top => {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(bounds.left(), bounds.bottom() - SEAM_WIDTH),
-                                size(bounds.size.width, SEAM_WIDTH),
-                            ),
-                            cx.theme().colors().border_variant,
-                        ));
                         if let Some((_, color)) = panel.gutter.first() {
                             let (left, _) = self.gutter_highlight_geometry(layout, cx);
                             window.paint_quad(fill(
                                 Bounds::new(
-                                    point(left.round(), bounds.top()),
-                                    size(px(2.), bounds.size.height),
+                                    point(left.round(), panel.text.bounds.top()),
+                                    size(px(2.), panel.text.bounds.size.height),
                                 ),
                                 *color,
                             ));
@@ -403,11 +392,12 @@ impl EditorElement {
                     let right = panel.text.bounds.right() - layout.position_map.em_advance;
                     let y = match panel.edge {
                         StuckEdge::Top => panel.text.bounds.bottom(),
-                        StuckEdge::Bottom => panel.chrome.top(),
+                        StuckEdge::Bottom => panel.text.chrome.top(),
                     };
                     let at = point(right - notice.width, y);
+                    // A top notice has the band's whole row.
                     let notice_height = match panel.edge {
-                        StuckEdge::Top => line_height / 2.,
+                        StuckEdge::Top => line_height,
                         StuckEdge::Bottom => {
                             window.paint_quad(fill(
                                 Bounds::new(

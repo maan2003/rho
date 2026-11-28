@@ -241,9 +241,9 @@ form_shot "$device" reading-notice
 The [open thread](laptop-reading.png) puts the draft above the newest message.
 The earlier messages read in place.
 On [laptop](laptop-reading-notice.png) and [phone](phone-reading-notice.png), the
-stuck draft starts at the same place as it did inline. The gutter runs to the
-seam beneath the last line; the notice uses that reserved space without moving
-the draft or the history.
+stuck draft starts at the same place as it did inline. The whole top zone is one
+canopy in the draft's tone, down to a row of band beneath the last line; the
+notice uses that band without moving the draft or the history.
 Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history grows below the draft, but the draft and caret stay put.

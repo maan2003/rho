@@ -1003,8 +1003,8 @@ impl Minibuffer {
                 .children(missing)
                 .into_any_element(),
             // The square panel: the question over a soft divider, then the
-            // answers, lifted above the dimmed screen on a crisp seam with
-            // a lit top edge and a deep shadow.
+            // answers, lifted above the dimmed screen by its tone and a
+            // faint edge, a step lighter on top. No shadow.
             crate::Layout::Desktop => div()
                 .id("rho-prompt")
                 .key_context("RhoMinibuffer")
@@ -1016,13 +1016,6 @@ impl Minibuffer {
                 .border_x_1()
                 .border_b_1()
                 .border_color(rho_window::style::prompt_panel_seam())
-                .shadow(vec![gpui::BoxShadow {
-                    color: gpui::black().opacity(0.72),
-                    offset: gpui::point(px(0.), px(18.)),
-                    blur_radius: px(44.),
-                    spread_radius: px(0.),
-                    inset: false,
-                }])
                 .child(
                     div()
                         .flex_none()

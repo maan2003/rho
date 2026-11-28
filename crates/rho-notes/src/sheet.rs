@@ -16,7 +16,10 @@
 //! crate (`rho-window`) owns the sheet and its tokens.
 
 use gpui::prelude::*;
-use gpui::{App, Font, Hsla, Pixels, TextRun, TextStyle, Window, WindowTextSystem, div, px};
+use gpui::{
+    App, Bounds, Entity, Font, Hsla, Pixels, TextRun, TextStyle, Window, WindowTextSystem, div,
+    point, px,
+};
 use rho_frame::Layout;
 use theme::ActiveTheme as _;
 
@@ -257,6 +260,34 @@ pub fn page(
     window: &Window,
     cx: &App,
 ) -> gpui::Div {
+    lay_out(heading, text, body, None, window, cx)
+}
+
+/// A [`page`] whose `editor` sticks its draft to the top edge
+/// (`window.Edge-stuck excerpt`). While the draft is stuck, the laptop's
+/// whole top zone is one canopy in the draft's own tone: from the window's
+/// top edge, across the heading, the top gap and the width of the window,
+/// down to the draft's lower edge. The window's status right of the notch
+/// lies on it too. Its tone alone sets it apart from the history below.
+pub fn page_with_canopy(
+    heading: &Heading,
+    text: &TextStyle,
+    body: impl IntoElement,
+    editor: &Entity<editor::Editor>,
+    window: &Window,
+    cx: &App,
+) -> gpui::Div {
+    lay_out(heading, text, body, Some(editor.clone()), window, cx)
+}
+
+fn lay_out(
+    heading: &Heading,
+    text: &TextStyle,
+    body: impl IntoElement,
+    canopy: Option<Entity<editor::Editor>>,
+    window: &Window,
+    cx: &App,
+) -> gpui::Div {
     let background = cx.theme().colors().editor_background;
     let root = div()
         .size_full()
@@ -275,29 +306,48 @@ pub fn page(
     // is cut a band gap before the notch.
     let left = rho_window::layout::sheet_left(viewport, sheet) + GUTTER;
     let ear = rho_window::layout::heading_room(left, rho_window::layout::Notch::of(viewport));
-    root.child(
-        div()
-            .h(TOP_LINE)
-            .flex_none()
-            .w_full()
-            .flex()
-            .flex_row()
-            .items_center()
-            .pl(left)
-            .child(top_line(heading).max_w(ear)),
-    )
-    .child(
-        div()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .flex()
-            .flex_row()
-            .justify_center()
-            .pt(TOP_GAP)
-            .px(READING_INSET)
-            .child(div().h_full().w_full().max_w(sheet).child(body)),
-    )
+    // Painted under the heading and the sheet. The editor lays the draft
+    // out before anything paints, so the canopy ends where the draft does
+    // in this same frame.
+    let canopy = canopy.map(|editor| {
+        gpui::canvas(
+            |_, _, _| (),
+            move |bounds, (), window, cx| {
+                if let Some(stuck) = editor.read(cx).stuck_excerpt_bounds() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::from_corners(bounds.origin, point(bounds.right(), stuck.bottom())),
+                        rho_window::style::command_strip_background(cx),
+                    ));
+                }
+            },
+        )
+        .absolute()
+        .size_full()
+    });
+    root.children(canopy)
+        .child(
+            div()
+                .h(TOP_LINE)
+                .flex_none()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .pl(left)
+                .child(top_line(heading).max_w(ear)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .pt(TOP_GAP)
+                .px(READING_INSET)
+                .child(div().h_full().w_full().max_w(sheet).child(body)),
+        )
 }
 
 /// The heading's words: the title in `title` at the text's own weight,

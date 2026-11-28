@@ -164,12 +164,6 @@ pub fn title_color(cx: &App) -> Hsla {
     cx.theme().colors().terminal_bright_foreground.into()
 }
 
-/// `global status surface`: the recessed field of the global status bar
-/// right of the notch, and of the prompt panel.
-pub fn global_status_surface(cx: &App) -> Hsla {
-    cx.theme().colors().status_bar_background.into()
-}
-
 /// `keys in motion`: a font color only, never a fill, for `INS` and the
 /// prompt row enter would take.
 pub fn keys_in_motion_color(cx: &App) -> Hsla {
@@ -191,14 +185,14 @@ pub fn prompt_panel_surface() -> Hsla {
     oklch(0.276, 0.020, 150.)
 }
 
-/// The prompt panel's crisp `1 px` edge.
+/// The prompt panel's faint `1 px` edge.
 pub fn prompt_panel_seam() -> Hsla {
-    oklch(0.380, 0.020, 150.)
+    oklch(0.305, 0.016, 150.)
 }
 
-/// The prompt panel's top edge, a step lighter, as if lit from above.
+/// The prompt panel's top edge, a step lighter.
 pub fn prompt_panel_top_seam() -> Hsla {
-    oklch(0.480, 0.025, 150.)
+    oklch(0.335, 0.018, 150.)
 }
 
 /// `notch mask`: the camera notch's own black, whatever the theme, so the

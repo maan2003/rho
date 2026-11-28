@@ -109,7 +109,7 @@ rejected:
 decided: 2026-11-26 · empty thread draft has zero placeholder text (just the 2px teal left gutter bar and cursor on row 1)
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the top of the thread, even after a restart.
-sees: the unsent text in muted teal (`design.marked`), with a `2 px` teal bar in the left gutter, on row 1 at the top of the thread above a soft horizontal hairline seam; when empty in a thread, shows no placeholder word at all — just the teal left gutter bar and cursor on a clean empty line. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lifted surface; on the phone it is in the half above the keyboard.
+sees: the unsent text in muted teal (`design.marked`), with a `2 px` teal bar in the left gutter, on row 1 at the top of the thread, set apart from the newest message by space alone (no divider line); when empty in a thread, shows no placeholder word at all — just the teal left gutter bar and cursor on a clean empty line. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, where the whole top zone of the window becomes one borderless canopy in its lifted tone (`design.Draft`); on the phone it is in the half above the keyboard.
 does:
 - edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
 - quote `>` on a selection in one read-only message: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal (inside the editable `Draft`, `>` stays normal Helix indent)
@@ -130,7 +130,7 @@ answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject, `Project` address, and any active page marker (`muted`, `snoozed until …`, `approve push`, `working`, `stopped by you`, `stuck`) in Thread's top-left title row beside the notch (omitting redundant `waits · age` and model name, which lives in `agents.Transcript`)
 - inside a `128 ch` centered sheet (`80 ch` wrap for prose/quotes/private replies; full `128 ch` width for code blocks, diffs, markdown tables, push cards, and images):
-- the `Draft` first on row 1 (no `reply` placeholder, `2 px` teal left gutter bar, soft hairline below), or stuck to the top edge while the user reads history below
+- the `Draft` first on row 1 (no `reply` placeholder, `2 px` teal left gutter bar, space alone below), or stuck to the top edge while the user reads history below
 - any pending staged push/fetch approval right below the draft (naming repo, refs, force-push dropped count, commits, bounded diff, and `space a approves · space x denies (with draft reply) · space s snoozes`)
 - the `Message` newest first, readable and copyable with the same motions and search as the `Draft`, but not editable; agent messages are the unmarked primary voice (one calm colour, read or not), user messages are muted teal with a `2 px` left gutter bar, and relative ages sit flush-right in `quiet`; no date separators and no collapsed history
 - the fresh `Flash` of each agent in `design.quiet` with its age flush-right, in its place among the messages, with that agent's earlier fresh flashes folded under it

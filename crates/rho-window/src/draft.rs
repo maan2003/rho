@@ -45,12 +45,14 @@ fn set_excerpt(
 }
 
 /// While the reader is in the history below, the draft stays at the top
-/// edge with `notice` at its end.
+/// edge on the `command strip`, a row of the same tone below it that
+/// holds `notice`, in `attention`, at its end.
 pub fn stick(editor: &mut Editor, notice: gpui::SharedString, cx: &mut Context<Editor>) {
     editor.set_stuck_excerpt(
         draft_path(),
         StuckEdge::Top,
         notice,
+        crate::style::attention_color,
         crate::style::command_strip_background,
         cx,
     );
@@ -185,7 +187,7 @@ mod tests {
         use editor::{EditorMode, SizingBehavior};
         use gpui::{point, px, size};
 
-        let (document, caret) = cx.update(|cx| {
+        let (document, caret, first_row) = cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
             let settings = settings::SettingsStore::test(cx);
             cx.set_global(settings);
@@ -196,11 +198,10 @@ mod tests {
             let draft = cx.new(|cx| Buffer::local("reference clock\nsecond line", cx));
             let history = cx.new(|cx| Buffer::local(&"history\n".repeat(70), cx));
             let document = document(&history, &draft, cx);
-            let caret = document
-                .read(cx)
-                .snapshot(cx)
-                .anchor_after(Point::new(1, 5));
-            (document, caret)
+            let snapshot = document.read(cx).snapshot(cx);
+            let caret = snapshot.anchor_after(Point::new(1, 5));
+            let first_row = snapshot.anchor_after(Point::new(0, 5));
+            (document, caret, first_row)
         });
         let window = cx.add_window(|window, cx| {
             let mut editor = Editor::new(
@@ -219,19 +220,22 @@ mod tests {
         });
         cx.simulate_window_resize(window.into(), size(px(610.), px(342.)));
         cx.draw_window(window.into());
-        let draft_xy =
-            |editor: &mut Editor, window: &mut gpui::Window, cx: &mut Context<Editor>| {
+        let xy_of = |anchor: Anchor| {
+            move |editor: &mut Editor, window: &mut gpui::Window, cx: &mut Context<Editor>| {
                 let display = editor.snapshot(window, cx);
                 editor
                     .window_position_for_display_point(
-                        caret.to_display_point(&display),
+                        anchor.to_display_point(&display),
                         &display,
                         window,
                         cx,
                     )
                     .unwrap()
-            };
+            }
+        };
+        let draft_xy = xy_of(caret);
         let inline = window.update(cx, draft_xy).unwrap();
+        let line_height = inline.y - window.update(cx, xy_of(first_row)).unwrap().y;
         window
             .update(cx, |editor, window, cx| {
                 editor.change_selections(Default::default(), window, cx, |selections| {
@@ -259,6 +263,12 @@ mod tests {
                     editor.snapshot(window, cx).max_point()
                 );
                 assert_eq!(draft_xy(editor, window, cx), inline);
+                // The draft's two rows and one row of band below them: a
+                // whole number of rows, so the projection's lower edge
+                // never cuts through a line of the history.
+                let stuck = editor.stuck_excerpt_bounds().unwrap();
+                assert_eq!(stuck.top(), inline.y - line_height);
+                assert_eq!(stuck.size.height, line_height * 3.);
                 let history = history_xy(editor);
                 editor.mark_stuck_excerpt(cx);
                 history

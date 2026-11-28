@@ -1904,20 +1904,35 @@ impl Frame {
     }
 
     /// The square black mask over the camera notch, unless `toggle notch
-    /// mask` turned it off, and, right of it, the framed global status bar
-    /// (`window.Status line`): the echo, the dealer focus, hosts that do
-    /// not answer, the unpaired notice, the waiting lamp, and the mode.
-    /// While an echo shows, it has the room of every quiet note; a host
-    /// that needs the user stays. Drawn over the screen and over a
-    /// prompt's dimming, so what rho says stays bright while a prompt is
-    /// open.
-    fn render_top_row(
+    /// mask` turned it off. Drawn over a prompt's dimming, so the notch
+    /// stays one square cut-out.
+    fn render_notch_mask(&self, notch: Notch) -> Option<AnyElement> {
+        self.notch_mask.then(|| {
+            div()
+                .id("rho-notch-mask")
+                .absolute()
+                .top_0()
+                .left(notch.start)
+                .w(notch.end - notch.start)
+                .h(px(TOP_ROW_PX))
+                .bg(rho_window::style::notch_mask_color())
+                .into_any_element()
+        })
+    }
+
+    /// The global status bar right of the notch (`window.Status line`):
+    /// the echo, the dealer focus, hosts that do not answer, the unpaired
+    /// notice, the waiting lamp, and the mode. While an echo shows, it has
+    /// the room of every quiet note; a host that needs the user stays. It
+    /// has no field or border of its own: its words lie on whatever the
+    /// screen paints there, and a prompt dims them with the screen.
+    fn render_status_bar(
         &mut self,
         text_style: &gpui::TextStyle,
         notch: Notch,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> impl Iterator<Item = AnyElement> + use<> {
+    ) -> AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
         let mode = mode_word(&self.mode(window, cx));
@@ -1945,18 +1960,7 @@ impl Frame {
                 .text_color(color)
                 .child(echo.text().to_owned())
         });
-        let mask = self.notch_mask.then(|| {
-            div()
-                .id("rho-notch-mask")
-                .absolute()
-                .top_0()
-                .left(notch.start)
-                .w(notch.end - notch.start)
-                .h(px(TOP_ROW_PX))
-                .bg(rho_window::style::notch_mask_color())
-                .into_any_element()
-        });
-        let bar = div()
+        div()
             .id("rho-status-bar")
             .absolute()
             .top_0()
@@ -1964,10 +1968,6 @@ impl Frame {
             .right_0()
             .h(px(TOP_ROW_PX))
             .px(px(EAR_GAP_PX))
-            .border_l_1()
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(rho_window::style::global_status_surface(cx))
             .occlude()
             .flex()
             .flex_row()
@@ -1998,8 +1998,7 @@ impl Frame {
                     .child(lamp)
             }))
             .child(mode_element(mode, mode_color))
-            .into_any_element();
-        mask.into_iter().chain([bar])
+            .into_any_element()
     }
 
     /// The status bar's notes beside the echo. An echo takes the room of
@@ -2253,7 +2252,8 @@ impl Render for Frame {
         // The screen fills the window from its top edge; only the notch
         // mask and the status bar right of it lie over it. A screen that
         // does not draw its own top-left corner gets one here, in its own
-        // layer, so a prompt dims it with the screen.
+        // layer, so a prompt dims it with the screen, as it dims the status
+        // bar. Only the prompt panel and the notch mask stay bright.
         let notch = Notch::of(width);
         let content = div()
             .size_full()
@@ -2290,7 +2290,7 @@ impl Render for Frame {
                     .absolute()
                     .inset_0()
                     .occlude()
-                    .bg(gpui::black().opacity(0.60))
+                    .bg(gpui::black().opacity(0.35))
                     .on_click(cx.listener(|this, _, window, cx| this.minibuffer_cancel(window, cx)))
                     .into_any_element(),
                 div()
@@ -2304,11 +2304,12 @@ impl Render for Frame {
                     .into_any_element(),
             ]
         });
-        let top_row = self.render_top_row(&text_style, notch, window, cx);
+        let status = self.render_status_bar(&text_style, notch, window, cx);
         frame
             .child(content)
+            .child(status)
             .children(prompt.into_iter().flatten())
-            .children(top_row)
+            .children(self.render_notch_mask(notch))
     }
 }
 

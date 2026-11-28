@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use gpui::{App, Context, Hsla, SharedString};
+use gpui::{App, Bounds, Context, Hsla, Pixels, SharedString};
 use multi_buffer::{Anchor, PathKey, ToPoint as _};
 
 use crate::display_map::{DisplaySnapshot, ToDisplayPoint as _};
@@ -29,6 +29,7 @@ pub(crate) struct StuckExcerpt {
     path: PathKey,
     pub(crate) edge: StuckEdge,
     pub(crate) background: fn(&App) -> Hsla,
+    pub(crate) label_color: fn(&App) -> Hsla,
     /// Offset within the excerpt, in vertical display units.
     offset: f64,
     followed_head: Option<Anchor>,
@@ -53,6 +54,7 @@ impl Editor {
         path: PathKey,
         edge: StuckEdge,
         pending_label: SharedString,
+        label_color: fn(&App) -> Hsla,
         background: fn(&App) -> Hsla,
         cx: &mut Context<Self>,
     ) {
@@ -60,6 +62,7 @@ impl Editor {
             path,
             edge,
             background,
+            label_color,
             offset: 0.0,
             followed_head: None,
             label: pending_label,
@@ -85,9 +88,15 @@ impl Editor {
     }
 
     pub fn stuck_excerpt_is_visible(&self) -> bool {
-        self.last_position_map
-            .as_ref()
-            .is_some_and(|map| map.stuck_excerpt.is_some())
+        self.stuck_excerpt_bounds().is_some()
+    }
+
+    /// Where the projection was last laid out, in window coordinates: its
+    /// rows and the band beside them. Laid out before anything paints, so
+    /// an element painted in the same frame can read it.
+    pub fn stuck_excerpt_bounds(&self) -> Option<Bounds<Pixels>> {
+        let map = self.last_position_map.as_ref()?;
+        map.stuck_excerpt.as_ref().map(|panel| panel.chrome)
     }
 
     /// Preserve a point in the excerpt on viewport (rather than point)
