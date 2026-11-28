@@ -629,6 +629,11 @@ impl WrapMap {
         true
     }
 
+    /// Where lines wrap, from the left edge of the text, if they wrap.
+    pub fn wrap_width(&self) -> Option<Pixels> {
+        self.wrap_width
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn set_soft_wrap_indent(&mut self, indent: SoftWrapIndent, cx: &mut Context<Self>) -> bool {
         if indent == self.soft_wrap_indent {

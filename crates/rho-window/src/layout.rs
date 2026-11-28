@@ -10,8 +10,9 @@ use gpui::{Div, Pixels, TextStyle, Window, div, px};
 /// The widest a screen's sheet is, in `ch` of the editor font: a calm
 /// margin on a 13" laptop, one straight left edge for every block.
 pub const SHEET_MAX_CH: f32 = 128.;
-/// Where prose wraps inside the sheet; code, tables and images take the
-/// whole sheet.
+/// Where text wraps inside the sheet, in the same `ch` as the sheet, so
+/// the two keep their proportion in any font: some 90 letters of Rho
+/// Font prose, whose letters are narrower than its `0`.
 pub const PROSE_MAX_CH: f32 = 80.;
 /// How wide the floating prompt panel (`Places`, `Commands`) is.
 pub const PROMPT_MAX_CH: f32 = 104.;

@@ -6,9 +6,9 @@
 //! is the screen's: its heading sits left of the notch on the first
 //! `TOP_LINE`, and its text sits below in a sheet `SHEET_COLUMNS` wide,
 //! centred, with `READING_INSET` of air from the window edge when the
-//! window is narrower. Prose wraps at `PROSE_COLUMNS` on the same left edge
-//! as the wide blocks (code, diffs, tables, push requests) that use the
-//! whole sheet.
+//! window is narrower. Text wraps at the prose measure, on the sheet's left
+//! edge; the sheet's width beyond it holds what sits beside the text, such
+//! as a thread's ages.
 //!
 //! The tokens here are the bundled dark appearance's (`product/design.md`).
 //! Every screen of the notes, the chat and the agents lays out with this
@@ -25,8 +25,6 @@ use theme::ActiveTheme as _;
 
 /// `design.sheet measure`.
 pub const SHEET_COLUMNS: usize = rho_window::layout::SHEET_MAX_CH as usize;
-/// `design.prose measure`.
-pub const PROSE_COLUMNS: usize = rho_window::layout::PROSE_MAX_CH as usize;
 /// `design.reading inset`.
 pub const READING_INSET: Pixels = px(rho_window::layout::READING_INSET_PX);
 /// `design.top line`.
@@ -164,10 +162,16 @@ pub fn sheet_width(text: &TextStyle, window: &Window) -> Pixels {
     column_width(text, window) * (SHEET_COLUMNS as f32 + 1.) + GUTTER
 }
 
-/// The width of a block of `columns` on the sheet: the same gutter and
-/// cursor column as the whole sheet.
-pub fn measure_width(text: &TextStyle, window: &Window, columns: usize) -> Pixels {
-    column_width(text, window) * (columns as f32 + 1.) + GUTTER
+/// `design.prose measure`: where text wraps, from the sheet's left edge
+/// of the words.
+pub fn prose_width(text: &TextStyle, window: &Window) -> Pixels {
+    column_width(text, window) * rho_window::layout::PROSE_MAX_CH
+}
+
+/// The width of an editor whose words wrap at the prose measure: the
+/// same gutter and cursor column as the whole sheet.
+pub fn prose_editor_width(text: &TextStyle, window: &Window) -> Pixels {
+    prose_width(text, window) + column_width(text, window) + GUTTER
 }
 
 /// Gives a sheet's editor the sheet's gutter: the bar at the sheet's left
@@ -382,81 +386,22 @@ pub fn top_line(heading: &Heading) -> gpui::Div {
     line
 }
 
-/// One line of prose wrapped at `width` columns, at spaces: a word longer
-/// than the line, such as a link, keeps its own line. A list item or a
-/// quote keeps its marker's indent, or the quote's `> `, on every line it
-/// wraps to, so the wrapped text reads as one item.
-pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    if line.chars().count() <= width {
-        return vec![line.to_owned()];
-    }
-    let (lead, hang) = hanging(line);
-    let mut out = Vec::new();
-    let mut current = lead.to_owned();
-    let mut current_len = lead.chars().count();
-    let mut empty = true;
-    for word in line[lead.len()..].split(' ') {
-        let len = word.chars().count();
-        if !empty && current_len + 1 + len > width {
-            out.push(std::mem::replace(&mut current, hang.clone()));
-            current_len = hang.chars().count();
-            empty = true;
-        }
-        if !empty {
-            current.push(' ');
-            current_len += 1;
-        }
-        current.push_str(word);
-        current_len += len;
-        empty = false;
-    }
-    out.push(current);
-    out
-}
-
-/// The text a wrapped line starts with, and what each line it wraps to
-/// starts with instead.
-fn hanging(line: &str) -> (&str, String) {
+/// How far the lines a list item or a quote wraps to are indented, in
+/// columns: under the words after the marker (`- `, `* `, `+ `, `12. `)
+/// or after the quote's `> `, past any indent before it. `None` for a line
+/// with no marker, whose wrapped lines keep its own indent.
+pub fn hanging_indent(line: &str) -> Option<u32> {
     let indent = line.len() - line.trim_start_matches(' ').len();
     let rest = &line[indent..];
-    if rest.starts_with("> ") {
-        let lead = &line[..indent + 2];
-        return (lead, lead.to_owned());
-    }
-    let marker = ["- ", "* ", "+ "]
+    let marker = ["- ", "* ", "+ ", "> "]
         .into_iter()
         .find(|marker| rest.starts_with(marker))
         .map(str::len)
         .or_else(|| {
             let digits = rest.chars().take_while(char::is_ascii_digit).count();
             (digits > 0 && rest[digits..].starts_with(". ")).then_some(digits + 2)
-        });
-    match marker {
-        Some(marker) => (&line[..indent + marker], " ".repeat(indent + marker)),
-        None => (&line[..indent], " ".repeat(indent)),
-    }
-}
-
-/// A body's lines, each marked whether it is prose that wraps at the
-/// prose measure or part of a wide block that takes the whole sheet: a
-/// fenced block (code, a diff), an indented code line, or a table row.
-pub fn blocks(body: &str) -> Vec<(&str, bool)> {
-    let mut fenced = false;
-    body.lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
-            let wide = fenced
-                || fence
-                || line.starts_with("    ")
-                || line.starts_with('\t')
-                || trimmed.starts_with('|');
-            if fence {
-                fenced = !fenced;
-            }
-            (line, !wide)
-        })
-        .collect()
+        })?;
+    u32::try_from(indent + marker).ok()
 }
 
 #[cfg(test)]
@@ -464,29 +409,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prose_wraps_at_spaces_and_keeps_its_markers() {
-        let words = "alpha beta gamma delta";
-        assert_eq!(wrap_line(words, 11), ["alpha beta", "gamma delta"]);
-        assert_eq!(wrap_line(words, 40), [words]);
-        // A link longer than the line keeps its own line, whole.
-        let link = "see https://example.com/a/very/long/path now";
-        assert_eq!(
-            wrap_line(link, 12),
-            ["see", "https://example.com/a/very/long/path", "now"]
-        );
-        assert_eq!(wrap_line("- one two three", 9), ["- one two", "  three"]);
-        assert_eq!(
-            wrap_line("12. one two three", 10),
-            ["12. one", "    two", "    three"]
-        );
-        assert_eq!(wrap_line("> one two three", 9), ["> one two", "> three"]);
-    }
-
-    #[test]
-    fn fenced_indented_and_table_lines_are_wide() {
-        let body = "Prose here.\n```rust\nlet x = 1;\n```\n| a | b |\n    indented\nafter";
-        let wide: Vec<_> = blocks(body).into_iter().map(|(_, prose)| !prose).collect();
-        assert_eq!(wide, [false, true, true, true, true, true, false]);
+    fn a_marker_hangs_its_wrapped_lines_under_its_words() {
+        assert_eq!(hanging_indent("- one two"), Some(2));
+        assert_eq!(hanging_indent("12. one two"), Some(4));
+        assert_eq!(hanging_indent("> quoted"), Some(2));
+        // A nested item hangs past its own indent too.
+        assert_eq!(hanging_indent("    * nested"), Some(6));
+        // Prose, a bare dash, and a number without its dot keep their indent.
+        assert_eq!(hanging_indent("plain words"), None);
+        assert_eq!(hanging_indent("-not a list"), None);
+        assert_eq!(hanging_indent("2026 was"), None);
+        assert_eq!(hanging_indent("  indented"), None);
     }
 
     #[test]

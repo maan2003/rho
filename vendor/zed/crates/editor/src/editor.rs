@@ -1119,6 +1119,8 @@ pub struct Editor {
     #[cfg(feature = "native")]
     inline_diagnostics: Vec<(Anchor, InlineDiagnostic)>,
     soft_wrap_mode_override: Option<language_settings::SoftWrap>,
+    /// The widest the soft wrap may be, however wide the editor is.
+    soft_wrap_limit: Option<Pixels>,
     hard_wrap: Option<usize>,
     #[cfg(feature = "native")]
     project: Option<Entity<Project>>,
@@ -1289,6 +1291,8 @@ pub struct Editor {
     /// motions, and goal columns never interact with them (neovim's
     /// eol virtual text).
     eol_hints: Vec<(Anchor, EolHintRenderer)>,
+    /// The margin right of the wrap edge that `eol_hints` stand in.
+    eol_hint_column: Pixels,
     #[cfg(feature = "native")]
     blame: Option<Entity<GitBlame>>,
     blame_subscription: Option<Subscription>,
@@ -2669,6 +2673,7 @@ impl Editor {
             #[cfg(feature = "native")]
             inline_diagnostics: Vec::new(),
             soft_wrap_mode_override,
+            soft_wrap_limit: None,
             diagnostics_max_severity,
             hard_wrap: None,
             #[cfg(feature = "native")]
@@ -2858,6 +2863,7 @@ impl Editor {
             blame_subscription: None,
             pending_blame_hover_observation: None,
             eol_hints: Vec::new(),
+            eol_hint_column: Pixels::ZERO,
 
             #[cfg(feature = "native")]
             bookmark_store,

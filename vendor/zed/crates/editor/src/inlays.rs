@@ -256,10 +256,15 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    /// Replaces the editor's end-of-line hints: annotations painted
-    /// after each anchored line's content, outside text flow. Unlike
-    /// inlays they occupy no display columns, so carets, motions, and
-    /// goal columns never interact with them.
+    /// Replaces the editor's end-of-line hints: annotations painted on
+    /// the first display row of each anchored line, outside text flow.
+    /// With soft wrap, the hints stand in one column, a margin just
+    /// right of the wrap edge, each flush right at its far side, so no
+    /// line reaches them and they align however long their lines are.
+    /// Without soft wrap, a hint sits an em after its line. Unlike inlays
+    /// they occupy no display columns, so carets, motions, and goal
+    /// columns never interact with them. The renderer runs on every
+    /// layout, so a hint that reads the clock is current after a `notify`.
     pub fn set_eol_hints(
         &mut self,
         hints: Vec<(Anchor, crate::EolHintRenderer)>,
@@ -267,6 +272,15 @@ impl Editor {
     ) {
         self.eol_hints = hints;
         cx.notify();
+    }
+
+    /// How wide the margin past the wrap edge is that end-of-line hints
+    /// stand in (see [`Self::set_eol_hints`]).
+    pub fn set_eol_hint_column(&mut self, column: gpui::Pixels, cx: &mut Context<Self>) {
+        if self.eol_hint_column != column {
+            self.eol_hint_column = column;
+            cx.notify();
+        }
     }
 
     pub fn eol_hints(&self) -> &[(Anchor, crate::EolHintRenderer)] {
